@@ -1,7 +1,7 @@
-python backend/dataio/tools/clickmap_cli.py \
+python backend/viz/clickmap.py \
   --out ./click_masks/my_points.json \
   --background ./datasets/noaa.npy \
   --bg-channel 0 \
   --points 300
 
-python backend/dataio/tools/clickmap_cli.py --out ./click_masks/blank_180x360.npy --hw 180 360
+python backend/viz/clickmap.py --out ./click_masks/blank_180x360.npy --hw 180 360
