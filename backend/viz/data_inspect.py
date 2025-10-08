@@ -1,11 +1,11 @@
-# backend/dataio/viz/inspect.py
+# backend/viz/data_inspect.py
 from __future__ import annotations
 from typing import Optional, Dict, Any, Union, Sequence, Tuple
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from ..schema import ArraySample, AdapterOutput
-from ..dataset.unified import UnifiedDataset
+from backend.dataio.schema import ArraySample, AdapterOutput
+from backend.dataio.dataset.unified import UnifiedDataset
 
 # 放在文件顶部 import 之后
 def _as_numpy(x):
