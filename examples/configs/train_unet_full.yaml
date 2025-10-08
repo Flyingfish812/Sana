@@ -1,0 +1,102 @@
+# ==========================================================
+# 完整训练/验证/测试（Trainer + Callbacks + Logger + Eval）
+# 适配我们当前的 EPD 模型与 train/ 侧代码
+# ==========================================================
+
+exp_name: "unet_baseline_epd"
+
+# --------- 模型装配（EPDSystem：Encoder→Propagator→Decoder→Head）---------
+model:
+  encoder:    { name: UNetBase, args: { base_channels: 32, depth: 4 } }
+  propagator: { name: Identity, args: {} }
+  decoder:    { name: UNetBase, args: { base_channels: 32 } }
+  head:       { name: PixelHead, args: { out_channels: 1 } }
+
+  loss:       { name: l1 }
+  optimizer:  { name: adamw, args: { lr: 1.0e-3, weight_decay: 1.0e-4 } }
+  scheduler:  { name: ReduceLROnPlateau, monitor: "val_total", args: { factor: 0.5, patience: 5 } }
+  reg_weights: { encoder: 0.0, propagator: 0.0, decoder: 0.0, head: 0.0 }
+
+# --------- 数据 ---------
+data:
+  from_run_dir: "prep_out/h5_sparse"  # ← 指向“上一存档点”的 run 目录
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  save_dataloaders: true  # 开启后，这一轮也会把 dataloaders 存到自己的 run 目录
+
+# data:
+#   builder: "backend.dataio.api:build_all"
+#   builder_args:
+#     snapshot_dir: "data_snapshots/unified"
+#   batch_size: 8
+#   num_workers: 4
+#   pin_memory: true
+#   persistent_workers: true
+#   save_dataloaders: true      # ← 本轮保存，下一轮就可用 from_run_dir 直接复用
+
+# --------- Trainer 配置（Lightning）---------
+trainer:
+  max_epochs: 50
+  precision: "16-mixed"           # 可选: "32" | "bf16-mixed"
+  accelerator: "auto"
+  devices: "auto"
+  strategy: "auto"
+  log_every_n_steps: 10
+  val_check_interval: 0.25
+  gradient_clip_val: 0.0
+  accumulate_grad_batches: 1
+  deterministic: true
+  benchmark: false
+  num_sanity_val_steps: 2
+  enable_checkpointing: true
+  enable_model_summary: true
+
+# --------- 日志系统 ---------
+logging:
+  logger: "tensorboard"           # 也可 "csv" | "jsonl"
+  save_dir: "runs"
+  name: "${exp_name}"             # 运行目录: runs/<exp_name>/<version>/
+  version: null                   # 留空=自动用时间戳
+
+# --------- 回调：早停、Checkpoint、学习率、可视化、梯度范数 ---------
+callbacks:
+  early_stopping:
+    enable: true
+    monitor: "val_total"
+    mode: "min"
+    patience: 10
+    min_delta: 0.0
+
+  checkpoint:
+    monitor: "val_total"
+    mode: "min"
+    save_top_k: 1
+    save_last: true
+    dirpath: null                  # 默认: runs/<exp>/<ver>/checkpoints
+    filename: "{epoch:03d}-{val_total:.4f}"
+    load_from: null                # 仅 run_test_only 用；训练时无需填写
+
+  lr_monitor:
+    enable: true
+    logging_interval: "epoch"
+
+  viz_triplets:
+    enable: true
+    every_n_steps: 200
+    num_triplets: 4
+
+  grad_norm:
+    enable: true
+    every_n_steps: 50
+
+# --------- 评估阶段（test + 离线评估&出图）---------
+eval:
+  enable: true
+  num_eval_batches: 3
+  num_plot_triplets: 6
+
+# --------- 训练种子 ---------
+train:
+  seed: 2025

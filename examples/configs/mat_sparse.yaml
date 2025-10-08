@@ -1,0 +1,49 @@
+reader:
+  kind: mat
+  path: ./testdata/sst_weekly_10pct.mat
+  var: sst
+  lon_key: lon
+  lat_key: lat
+  time_key: time
+
+sampler:
+  kind: per_frame
+  # t_stride: 1
+  # n: 0
+
+transforms:
+  # 先对 NaN 做处理，避免影响后续归一化/插值
+  fillna: { method: value, value: -273.15 }        # 或 { method: value, value: -273.15 }
+  normalize: { method: zscore }
+
+adapter:
+  kind: sparse2d
+  mode: random                    # random | mask
+  num_points: 20
+  seed: 123
+  nn_block_size: 8192
+  include_mask_in_cond: true      # 在 batch["cond"] 中得到 [B,1,H,W] 的采样掩码
+  include_points_in_cond: true    # 在 batch["sampling_points"] 中得到每样本点列表
+  # 若使用外部点击掩码：
+  # mode: mask
+  # mask_path: ./click_masks/noaa_180x360.json
+
+split:
+  enable: true
+  strategy: temporal   # or "random"
+  unit: frame          # or "sequence"
+  ratios: { train: 0.8, val: 0.1, test: 0.1 }
+  seed: 123
+
+batch_size: 8
+num_workers: 0
+shuffle: true
+
+output:
+  out_dir: ./prep_out/mat_sparse
+  save_array5d: true
+  snapshot:
+    enable: true
+    part_size_gb: 1.0
+    gzip: false
+  overwrite: true

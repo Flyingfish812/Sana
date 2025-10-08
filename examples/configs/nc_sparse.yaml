@@ -1,0 +1,55 @@
+reader:
+  kind: nc
+  path: ./testdata/cylinder2d_subset_10pct.nc        # ← 你的 .nc 文件
+  var_keys: ["u", "v"]             # 自定义所需变量；只有一个变量时可写单值列表
+  u_key: u                         # 若计算涡量需提供 u_key/v_key
+  v_key: v
+  want_omega: true                 # 追加涡量通道 (omega)
+  dx: 1.0                          # 计算涡量的网格间距（按需调整）
+  dy: 1.0
+  # time_key: time                 # 如坐标命名特殊可覆盖
+  # y_key: lat
+  # x_key: lon
+  # fill_value: 0.0                # 若要在 Reader 粗填 NaN，可开启；通常用 transforms.fillna
+
+sampler:
+  kind: per_frame                     # 也可用 multi_frame（若做时序条件）
+  # t_stride: 1
+  # n: 0
+
+transforms:
+  # 大多数 NC 数据不会大量 NaN；若存在，建议开启：
+  # fillna: { method: mean }
+  normalize: { method: zscore }
+
+adapter:
+  kind: sparse2d
+  mode: random
+  num_points: 20
+  seed: 2025
+  nn_block_size: 8192
+  include_mask_in_cond: true
+  include_points_in_cond: true
+  # 若使用外部点击掩码：
+  # mode: mask
+  # mask_path: ./click_masks/nc_clicks.json
+
+split:
+  enable: true
+  strategy: temporal   # or "random"
+  unit: frame          # or "sequence"
+  ratios: { train: 0.8, val: 0.1, test: 0.1 }
+  seed: 123
+
+batch_size: 4
+num_workers: 0
+shuffle: true
+
+output:
+  out_dir: ./prep_out/nc_sparse
+  save_array5d: true
+  snapshot:
+    enable: true
+    part_size_gb: 1.0
+    gzip: false
+  overwrite: true

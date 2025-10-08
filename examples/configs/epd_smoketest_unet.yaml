@@ -1,0 +1,20 @@
+# 模型模块选择（与我们已实现的注册表对齐）
+model:
+  encoder:    { name: UNetBase, args: { base_channels: 32, depth: 4 } }
+  propagator: { name: Identity, args: {} }
+  decoder:    { name: UNetBase, args: { base_channels: 32 } }
+  head:       { name: PixelHead, args: { out_channels: 1 } }
+  loss:       { name: l1 }
+  optimizer:  { name: adamw, args: { lr: 1.0e-3 } }
+  # 固定的简易学习率调度（可无需）
+  scheduler:  null
+  reg_weights: { encoder: 0.0, propagator: 0.0, decoder: 0.0, head: 0.0 }
+
+# 训练与测试的固定参数（不是 lightning.Trainer）
+runner:
+  max_epochs: 2
+  log_every_n_steps: 10
+  device: "auto"        # "cpu"|"cuda"| "auto"
+  num_eval_batches: 3
+  num_plot_triplets: 4  # 推理可视化保存几组三连图
+  out_dir: "runs/epd_smoketest_unet"  # 输出目录
