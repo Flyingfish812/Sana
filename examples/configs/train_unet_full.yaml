@@ -38,7 +38,7 @@ data:
 
 # --------- Trainer 配置（Lightning）---------
 trainer:
-  max_epochs: 50
+  max_epochs: 5
   precision: "16-mixed"           # 可选: "32" | "bf16-mixed"
   accelerator: "auto"
   devices: "auto"

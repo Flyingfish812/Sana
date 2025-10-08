@@ -1,5 +1,6 @@
 datasets
-all_code
+all_code.*
+*_code.txt
 game
 prep_out
 runs
