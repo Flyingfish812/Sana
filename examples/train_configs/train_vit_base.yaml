@@ -5,9 +5,22 @@
 exp_name: &exp_name "vit_base_epd"
 
 model:
-  encoder:    { name: ViTEncoder, args: { in_channels: 3, embed_dim: 256, patch_size: 16, dropout: 0.1 } }
+  encoder:
+    name: ViTEncoder
+    args:
+      __replace__: true
+      in_channels: 3
+      embed_dim: 256
+      patch_size: 16
+      dropout: 0.1
   propagator: { name: ViTTransformer, args: { embed_dim: 256, depth: 8, num_heads: 8, mlp_ratio: 4.0, dropout: 0.1, attention_dropout: 0.0, droppath: 0.1 } }
-  decoder:    { name: ViTPatchDecoder, args: { embed_dim: 256, patch_size: 16, dropout: 0.0 } }
+  decoder:
+    name: ViTPatchDecoder
+    args:
+      __replace__: true
+      embed_dim: 256
+      patch_size: 16
+      dropout: 0.0
   head:       { name: PixelHead, args: { out_channels: 1 } }
 
   loss:       { name: l1 }
