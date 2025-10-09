@@ -7,13 +7,14 @@ from typing import Any, Dict, Optional
 
 import torch
 from torch.utils.data import DataLoader
+import yaml
 
-from backend.common import ensure_dir, ensure_5d, extract_xy, move_batch_to_device
-from backend.viz.images import save_triplet_grid
+from backend.common import ensure_dir, move_batch_to_device
 
 from backend.model.epd_system import EPDSystem
 from ..data_adapter import build_dataloaders
 from ..inspect import save_model_summary
+from ..eval import evaluate, render_eval_triplets
 
 
 def _select_device(device: str) -> torch.device:
@@ -42,8 +43,13 @@ def basic_fit(
     log_fp = (out_dir / "train_log.jsonl").open("a", encoding="utf-8")
     global_step = 0
 
+    best_metric = float("inf")
+    best_path = out_dir / "model_best.pt"
+    last_loss_value = None
+
     for ep in range(epochs):
         model.train()
+        train_losses = []
         for i, batch in enumerate(train_dl):
             batch = move_batch_to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
@@ -51,6 +57,10 @@ def basic_fit(
             loss.backward()
             optimizer.step()
             global_step += 1
+
+            loss_value = float(loss.detach().cpu().item())
+            train_losses.append(loss_value)
+            last_loss_value = loss_value
 
             if scheduler and not isinstance(scheduler, dict):
                 scheduler.step()
@@ -60,12 +70,13 @@ def basic_fit(
                     "phase": "train",
                     "epoch": ep,
                     "step": global_step,
-                    "loss": float(loss.detach().cpu().item()),
+                    "loss": loss_value,
                 }
                 log_fp.write(json.dumps(rec) + "\n")
                 log_fp.flush()
                 print(rec)
 
+        train_mean = float(sum(train_losses) / len(train_losses)) if train_losses else None
         val_mean = None
         if val_dl is not None:
             model.eval()
@@ -89,49 +100,15 @@ def basic_fit(
 
         if scheduler and isinstance(scheduler, dict):
             sched = scheduler["scheduler"]
-            monitor_val = val_mean if val_mean is not None else float(loss.detach().cpu().item())
+            monitor_val = val_mean if val_mean is not None else (train_mean if train_mean is not None else last_loss_value)
             sched.step(monitor_val)
 
-        torch.save({"state_dict": model.state_dict()}, out_dir / f"model_epoch{ep}.pt")
+        metric = val_mean if val_mean is not None else (train_mean if train_mean is not None else last_loss_value)
+        if metric is not None and metric < best_metric:
+            best_metric = metric
+            torch.save({"state_dict": model.state_dict()}, best_path)
 
     log_fp.close()
-
-
-@torch.no_grad()
-def eval_and_plot(
-    model: EPDSystem,
-    test_dl: DataLoader,
-    device: torch.device,
-    out_dir: Path,
-    num_eval_batches: int = 3,
-    num_plot_triplets: int = 4,
-) -> None:
-    img_dir = ensure_dir(out_dir / "eval_vis")
-    model.eval()
-    model.to(device)
-
-    plotted, batches = 0, 0
-    for batch in test_dl:
-        if batches >= num_eval_batches or plotted >= num_plot_triplets:
-            break
-
-        batch = move_batch_to_device(batch, device)
-        x, y, _ = extract_xy(batch)
-        y_hat = model(ensure_5d(x))
-        if x.ndim == 4:
-            y_hat = y_hat.squeeze(2)
-
-        take = min(x.shape[0], num_plot_triplets - plotted)
-        for idx in range(take):
-            save_triplet_grid(
-                x[idx] if x.ndim == 4 else x[idx, :, 0],
-                y_hat[idx] if y_hat.ndim == 4 else y_hat[idx, :, 0],
-                y[idx] if y.ndim == 4 else y[idx, :, 0],
-                img_dir / f"triplet_b{batches}_i{idx}.png",
-            )
-            plotted += 1
-
-        batches += 1
 
 
 def run_smoke(
@@ -143,6 +120,10 @@ def run_smoke(
     """Execute a short training run for rapid validation of configs."""
 
     out_dir = ensure_dir(Path(cfg["runner"]["out_dir"]).resolve())
+    (out_dir / "config.dump.yaml").write_text(
+        yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
 
     train_dl, val_dl, test_dl = build_dataloaders(cfg.get("data", {}), injected=(train_dl, val_dl, test_dl))
     if train_dl is None or test_dl is None:
@@ -175,13 +156,27 @@ def run_smoke(
     except Exception:
         pass
 
-    eval_and_plot(
-        model,
-        test_dl,
-        device,
-        out_dir,
-        num_eval_batches=cfg["runner"].get("num_eval_batches", 3),
-        num_plot_triplets=cfg["runner"].get("num_plot_triplets", 4),
-    )
+    eval_cfg = {
+        "num_eval_batches": cfg["runner"].get("num_eval_batches", 3),
+        "num_plot_triplets": cfg["runner"].get("num_plot_triplets", 4),
+    }
+    model.to(device)
+    model.eval()
+    eval_vis = render_eval_triplets(model, test_dl, out_dir, eval_cfg)
+    evaluate(model, test_dl, out_dir, eval_cfg)
 
-    return model, {"out_dir": str(out_dir), "ckpt": str(last_ckpt)}
+    best_ckpt = out_dir / "model_best.pt"
+    if not best_ckpt.exists():
+        torch.save({"state_dict": model.state_dict()}, best_ckpt)
+
+    artefacts = {
+        "run_dir": str(out_dir),
+        "best_checkpoint": str(best_ckpt),
+        "last_checkpoint": str(last_ckpt),
+        "train_log": str(out_dir / "train_log.jsonl"),
+        "eval_log": str(out_dir / "eval_log.jsonl"),
+        "eval_vis": str(eval_vis),
+        "config": str(out_dir / "config.dump.yaml"),
+    }
+
+    return model, artefacts
