@@ -20,17 +20,41 @@ class Normalizer:
     minv: Optional[np.ndarray] = None  # [C]
     maxv: Optional[np.ndarray] = None  # [C]
 
-    def fit(self, frames: np.ndarray):
+    def fit(self, frames: np.ndarray, mask: Optional[np.ndarray] = None):
         # frames: [K,H,W,C] 或 [N,K,H,W,C]（采样前期这里一般是 [K,H,W,C]）
         if frames.ndim == 5:  # 合并 N
             frames = frames.reshape(-1, *frames.shape[-3:])
         C = frames.shape[-1]
+
+        if mask is not None:
+            mask_arr = np.asarray(mask)
+            if mask_arr.ndim == 3 and mask_arr.shape[-1] == 1:
+                mask_arr = mask_arr[..., 0]
+            if mask_arr.ndim == 2:
+                mask_arr = np.broadcast_to(mask_arr[None, ...], frames.shape[:-1])
+            elif mask_arr.ndim == 3:
+                if mask_arr.shape[0] not in (1, frames.shape[0]):
+                    raise ValueError("mask first dim must be 1 or match frame steps")
+                if mask_arr.shape[0] == 1:
+                    mask_arr = np.broadcast_to(mask_arr, frames.shape[:-1])
+            else:
+                mask_arr = np.ones(frames.shape[:-1], dtype=bool)
+            valid_mask = mask_arr.astype(bool)
+        else:
+            valid_mask = np.ones(frames.shape[:-1], dtype=bool)
+
+        flat = frames.reshape(-1, C)
+        mask_flat = valid_mask.reshape(-1)
+        if not np.any(mask_flat):
+            mask_flat = np.ones_like(mask_flat, dtype=bool)
         if self.method == "zscore":
-            self.mean = frames.reshape(-1, C).mean(axis=0)
-            self.std = frames.reshape(-1, C).std(axis=0) + self.eps
+            masked_values = flat[mask_flat]
+            self.mean = masked_values.mean(axis=0)
+            self.std = masked_values.std(axis=0) + self.eps
         elif self.method == "minmax":
-            self.minv = frames.reshape(-1, C).min(axis=0)
-            self.maxv = frames.reshape(-1, C).max(axis=0)
+            masked_values = flat[mask_flat]
+            self.minv = masked_values.min(axis=0)
+            self.maxv = masked_values.max(axis=0)
         else:
             raise ValueError(f"Unknown method: {self.method}")
 
@@ -63,7 +87,8 @@ class NormalizeTransform(Transform):
     def __call__(self, sample: ArraySample) -> ArraySample:
         if self.normalizer.mean is None and self.normalizer.std is None \
            and self.normalizer.minv is None and self.normalizer.maxv is None:
-            self.normalizer.fit(sample.frames)
+            mask = getattr(sample.meta, "mask_static", None)
+            self.normalizer.fit(sample.frames, mask=mask)
         sample.frames = self.normalizer.transform(sample.frames)
         return sample
 

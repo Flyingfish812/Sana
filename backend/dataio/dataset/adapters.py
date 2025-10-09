@@ -142,12 +142,28 @@ def Sparse2DAdapter(sample: ArraySample, *,
     target = frames[-1]               # [H,W,C]
     H, W, C = target.shape
 
-    # 1) 可采样区域
-    finite = _finite_mask(target) if avoid_nan else np.ones((H,W), dtype=bool)
+    meta_mask = getattr(sample.meta, "mask_static", None)
+    if meta_mask is not None:
+        mask_arr = np.asarray(meta_mask)
+        if mask_arr.ndim == 3 and mask_arr.shape[-1] == 1:
+            mask_arr = mask_arr[..., 0]
+        valid_mask = mask_arr.astype(bool)
+    else:
+        valid_mask = _finite_mask(target) if avoid_nan else np.ones((H, W), dtype=bool)
+
+    # 选择预测通道
+    channel_names = []
+    if sample.meta.attrs and "channels" in sample.meta.attrs:
+        channel_names = list(sample.meta.attrs.get("channels") or [])
+    if channel_names and "omega" in channel_names:
+        target_idx = channel_names.index("omega")
+    else:
+        target_idx = 0
+    target_map = target[..., target_idx]
 
     # 2) 采样点
     if mode == "random":
-        ys, xs = np.where(finite)
+        ys, xs = np.where(valid_mask)
         if ys.size == 0:
             ys, xs = np.indices((H,W)).reshape(2, -1)
         # 控制是否随时间抖动
@@ -171,7 +187,7 @@ def Sparse2DAdapter(sample: ArraySample, *,
     if reuse_points == "per_dataset":
         cache_key = _hash_points(pts, H, W)
     elif reuse_points == "per_mask":
-        mh = hashlib.blake2b(digest_size=16); mh.update(finite.astype(np.uint8).tobytes()); mh.update(np.int64(H).tobytes()); mh.update(np.int64(W).tobytes())
+        mh = hashlib.blake2b(digest_size=16); mh.update(valid_mask.astype(np.uint8).tobytes()); mh.update(np.int64(H).tobytes()); mh.update(np.int64(W).tobytes())
         cache_key = mh.hexdigest()
     # else: reuse_points == "none" → 每次不缓存
 
@@ -188,28 +204,27 @@ def Sparse2DAdapter(sample: ArraySample, *,
             _IDX_MAP_CACHE[cache_key] = idx_map
 
     # 4) 采样值 + 直接映射生成估计图（O(HW)）
-    vals = target[pts[:,0], pts[:,1], :].astype(np.float32)  # [M,C]
-    x_est = vals[idx_map]                                    # [H,W,C]
+    vals = target_map[pts[:,0], pts[:,1]].astype(np.float32)[:, None]  # [M,1]
+    x_est = vals[idx_map][..., 0]                                    # [H,W]
 
     # 5) 输出
-    y = np.transpose(target, (2,0,1))   # [C,H,W]
+    y = target_map[None, ...]   # [1,H,W]
 
-    # 构造包含重建、掩码以及原始采样值的 3 通道输入
-    recon = x_est[..., 0] if x_est.shape[-1] >= 1 else np.zeros((H, W), dtype=np.float32)
-    mask_img = np.zeros((H, W), dtype=np.float32)
-    mask_img[pts[:,0], pts[:,1]] = 1.0
-    masked = (target[..., 0] if target.shape[-1] >= 1 else np.zeros((H, W), dtype=target.dtype)) * mask_img
+    recon = x_est.astype(np.float32)
+    points_mask = np.zeros((H, W), dtype=np.float32)
+    points_mask[pts[:,0], pts[:,1]] = 1.0
+    valid_mask_img = valid_mask.astype(np.float32)
     x = np.stack([
-        recon.astype(np.float32),
-        mask_img,
-        masked.astype(np.float32),
+        recon,
+        points_mask,
+        valid_mask_img,
     ], axis=0)
 
     cond = None
     if include_mask_in_cond or include_points_in_cond:
         cond = {}
         if include_mask_in_cond:
-            cond["mask"] = mask_img[None, ...]  # [1,H,W]
+            cond["mask"] = points_mask[None, ...]  # [1,H,W]
         if include_points_in_cond:
             cond["points"] = pts  # [M,2] (y,x)
 

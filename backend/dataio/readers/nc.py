@@ -110,6 +110,8 @@ class NCReader(BaseReader):
         self.fill_value = fill_value
         self.path_compat_workaround = bool(path_compat_workaround)
 
+        self._channel_names: Optional[List[str]] = None
+        self._mask_static: Optional[np.ndarray] = None
         self._shape5d, self._meta = self._probe_file()
 
     @staticmethod
@@ -241,7 +243,10 @@ class NCReader(BaseReader):
                 channel_names.append("omega")
 
             shape5d: Shape5D = (1, T, H, W, C)
-            meta = DataMeta(times=times, attrs={
+            self._channel_names = channel_names
+            mask = np.ones((H, W, 1), dtype=np.float32)
+            self._mask_static = mask
+            meta = DataMeta(times=times, mask_static=mask, attrs={
                 "source": "nc",
                 "path": self.path,
                 "tmp_used": bool(tmp_used),
@@ -286,6 +291,10 @@ class NCReader(BaseReader):
             # 拼通道 → [T,H,W,C]
             thwc = np.stack(thw_list, axis=-1)  # float32
             arr5d = thwc[None, ...]             # [1,T,H,W,C]
+            H, W = thwc.shape[1:3]
+            if self._mask_static is None:
+                mask = np.ones((H, W, 1), dtype=np.float32)
+                self._mask_static = mask
 
             # times
             times = self._meta.times
@@ -295,11 +304,14 @@ class NCReader(BaseReader):
                 except Exception:
                     times = None
 
-            self._meta = DataMeta(times=times, attrs={
+            attrs = {
                 "source": "nc",
                 "path": self.path,
                 "tmp_used": bool(tmp_used),
-            })
+            }
+            if self._channel_names is not None:
+                attrs["channels"] = self._channel_names
+            self._meta = DataMeta(times=times, mask_static=self._mask_static, attrs=attrs)
             return arr5d
         finally:
             ds.close()

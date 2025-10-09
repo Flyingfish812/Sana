@@ -135,6 +135,8 @@ class MatReader(BaseReader):
     def _build_array5d(self) -> np.ndarray:
         var, lon, lat, times = self._read_core()
         thw = self._reshape_var(var, lon, lat)          # [T,H,W]
+        valid_mask = np.isfinite(thw).all(axis=0, keepdims=False).astype(np.float32)
+        self._mask_static = valid_mask[..., None]
         if self.fill_value is not None:
             thw = np.nan_to_num(thw, nan=self.fill_value, posinf=self.fill_value, neginf=self.fill_value)
         tchw = thw[..., None]                            # [T,H,W,1]
@@ -144,7 +146,19 @@ class MatReader(BaseReader):
 
     def _probe_file(self) -> Tuple[Shape5D, DataMeta]:
         arr = self._build_array5d()
-        meta = DataMeta(times=getattr(self, "_times", None), attrs={"source": "mat", "path": self.path, "var": self.var})
+        mask_static = getattr(self, "_mask_static", None)
+        if mask_static is not None:
+            mask_static = mask_static.astype(np.float32)
+        meta = DataMeta(
+            times=getattr(self, "_times", None),
+            mask_static=mask_static,
+            attrs={
+                "source": "mat",
+                "path": self.path,
+                "var": self.var,
+                "channels": [self.var],
+            },
+        )
         N,T,H,W,C = arr.shape
         return (N,T,H,W,C), meta
 

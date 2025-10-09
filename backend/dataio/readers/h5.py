@@ -33,6 +33,8 @@ class H5Reader(BaseReader):
         self.group = group
         self.times_key = times_key
         self.fill_value = fill_value
+        self._channel_names: Optional[List[str]] = None
+        self._mask_static: Optional[np.ndarray] = None
         self._shape5d, self._meta = self._probe_file()
 
     # ---------- helpers ----------
@@ -96,12 +98,15 @@ class H5Reader(BaseReader):
             per_key: List[np.ndarray] = []
             nN = None
             first_parent = None
+            channel_names: List[str] = []
 
             for k in keys:
                 # 情况 a) 精确路径（含斜杠）
                 if "/" in k and k in f and self._is_ds(f[k]):
                     arr = self._read_ds(f[k])
-                    per_key.append(self._to_THWC(arr)[None, ...][0])  # 临时存回 [T,H,W,C]
+                    arr_thwc = self._to_THWC(arr)[None, ...][0]
+                    per_key.append(arr_thwc)  # 临时存回 [T,H,W,C]
+                    channel_names.extend([k] * arr_thwc.shape[-1])
                     # times：若 times_key 为空，尝试 k 的父组
                     if times is None and not self.times_key:
                         parent = "/".join(k.split("/")[:-1])
@@ -109,7 +114,9 @@ class H5Reader(BaseReader):
                 # 情况 b) 根下同名
                 elif k in f and self._is_ds(f[k]):
                     arr = self._read_ds(f[k])
-                    per_key.append(self._to_THWC(arr)[None, ...][0])
+                    arr_thwc = self._to_THWC(arr)[None, ...][0]
+                    per_key.append(arr_thwc)
+                    channel_names.extend([k] * arr_thwc.shape[-1])
                     if times is None and not self.times_key:
                         first_parent = ""
                 else:
@@ -122,6 +129,7 @@ class H5Reader(BaseReader):
                     if nN is None: nN = arrN.shape[0]
                     elif nN != arrN.shape[0]: raise ValueError("Different N across variables")
                     per_key.append(arrN)  # [N,T,H,W,C]
+                    channel_names.extend([k] * arrN.shape[-1])
                     if times is None and not self.times_key:
                         first_parent = "/".join(hits[0].split("/")[:-1])
 
@@ -135,6 +143,8 @@ class H5Reader(BaseReader):
                 elif Nref != aa.shape[0]: raise ValueError("N mismatch when joining variables")
                 norm5.append(aa)
             out = np.concatenate(norm5, axis=-1)  # [N,T,H,W,Csum]
+            if channel_names:
+                self._channel_names = channel_names
 
             # 自动发现 times
             if self.times_key:
@@ -158,6 +168,8 @@ class H5Reader(BaseReader):
                     elif isinstance(v,h5py.Group): yield from walk(v)
             arrays = [self._read_ds(ds) for ds in walk(f[self.group])]
             out = self._stack_N_or_concat_C(arrays, expect_stack_N=False)  # [1,T,H,W,C]
+            if self.group is not None:
+                self._channel_names = ["group"] * out.shape[-1]
             # times
             if self.times_key:
                 if self.times_key in f and self._is_ds(f[self.times_key]):
@@ -173,6 +185,7 @@ class H5Reader(BaseReader):
         for k,v in f.items():
             if self._is_ds(v):
                 out = self._stack_N_or_concat_C([self._read_ds(v)], expect_stack_N=False)
+                self._channel_names = [k] * out.shape[-1]
                 return out, None
         raise KeyError("No dataset found at root.")
 
@@ -180,7 +193,13 @@ class H5Reader(BaseReader):
         with h5py.File(self.path, "r") as f:
             arr, times = self._collect(f)
         N,T,H,W,C = arr.shape
-        return (N,T,H,W,C), DataMeta(times=times, attrs={"source":"h5","path":self.path})
+        mask = np.all(np.isfinite(arr), axis=(0,1,4)).astype(np.float32)
+        self._mask_static = mask[..., None]
+        attrs = {"source":"h5","path":self.path}
+        if self._channel_names:
+            attrs["channels"] = self._channel_names
+        meta = DataMeta(times=times, mask_static=self._mask_static, attrs=attrs)
+        return (N,T,H,W,C), meta
 
     def probe(self) -> Tuple[Shape5D, DataMeta]:
         return self._shape5d, self._meta
@@ -188,6 +207,13 @@ class H5Reader(BaseReader):
     def read_array5d(self, subset: Optional[Dict[str, Any]] = None) -> Array5D:
         with h5py.File(self.path, "r") as f:
             arr, _ = self._collect(f)
+        if self._mask_static is None:
+            mask = np.all(np.isfinite(arr), axis=(0,1,4)).astype(np.float32)
+            self._mask_static = mask[..., None]
+        attrs = {"source":"h5","path":self.path}
+        if self._channel_names:
+            attrs["channels"] = self._channel_names
+        self._meta = DataMeta(times=self._meta.times, mask_static=self._mask_static, attrs=attrs)
         return self._ensure_5d(arr)
 
 @register_reader("h5")
