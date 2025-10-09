@@ -5,12 +5,14 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 import json
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 from .config import load_config
 from .data_adapter import build_dataloaders, maybe_save_dataloaders
 from .logging import build_loggers, prepare_run_dir
 from .callbacks import build_callbacks
 from .inspect import save_model_summary, dump_arch_spec
+from .eval import evaluate, render_eval_triplets
 from .utils import seed_everything
 from backend.model.epd_system import EPDSystem
 
@@ -44,7 +46,7 @@ def run_training(
     train_dl: Optional[DataLoader] = None,
     val_dl: Optional[DataLoader] = None,
     test_dl: Optional[DataLoader] = None,
-) -> Tuple[EPDSystem, Path]:
+) -> Tuple[EPDSystem, Dict[str, str]]:
     """支持：显式注入 dataloaders 或按 cfg.data 自动读取"""
     cfg = load_config(cfg)
     seed_everything(cfg["train"]["seed"], deterministic=cfg["trainer"].get("deterministic", True))
@@ -81,7 +83,40 @@ def run_training(
     trainer = _trainer_from_cfg(cfg, loggers, callbacks)
     trainer.fit(model, train_dataloaders=train_dl, val_dataloaders=val_dl)
 
-    if cfg.get("eval", {}).get("enable", True) and test_dl is not None:
+    eval_cfg = cfg.get("eval", {})
+    eval_enabled = eval_cfg.get("enable", True) and test_dl is not None
+
+    if eval_enabled:
         trainer.test(model, dataloaders=test_dl)
 
-    return model, run_dir
+    # Collect checkpoints and evaluation artefacts for consistent outputs.
+    best_ckpt: Optional[Path] = None
+    for cb in callbacks:
+        if isinstance(cb, ModelCheckpoint):
+            if cb.best_model_path:
+                best_ckpt = Path(cb.best_model_path)
+            break
+
+    if best_ckpt is None:
+        ckpt_dir = run_dir / "checkpoints"
+        if ckpt_dir.exists():
+            candidates = sorted(ckpt_dir.glob("*.ckpt"))
+            if candidates:
+                best_ckpt = candidates[0]
+
+    if eval_enabled:
+        model.eval()
+        eval_vis = render_eval_triplets(model, test_dl, run_dir, eval_cfg)
+        evaluate(model, test_dl, run_dir, eval_cfg)
+    else:
+        eval_vis = run_dir / "eval_vis"
+
+    artefacts = {
+        "run_dir": str(run_dir),
+        "best_checkpoint": str(best_ckpt) if best_ckpt else "",
+        "config": str(run_dir / "config.dump.yaml"),
+        "eval_log": str(run_dir / "eval_log.jsonl"),
+        "eval_vis": str(eval_vis),
+    }
+
+    return model, artefacts

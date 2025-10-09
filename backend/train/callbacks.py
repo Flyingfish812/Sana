@@ -69,7 +69,7 @@ def build_callbacks(cb_cfg: Dict[str, Any], root_cfg: Dict, run_dir: Path) -> Li
         monitor=ck.get("monitor", "val_total"),
         mode=ck.get("mode", "min"),
         save_top_k=ck.get("save_top_k", 1),
-        save_last=ck.get("save_last", True),
+        save_last=ck.get("save_last", False),
         dirpath=dirpath,
         filename=ck.get("filename", "{epoch:03d}-{val_total:.4f}"),
         auto_insert_metric_name=False,
