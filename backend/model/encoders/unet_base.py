@@ -6,14 +6,15 @@ from typing import List
 from ..base_components.encoder_base import BaseEncoder
 from ..factory import register
 from ..utils.pool import PoolAwareTime
+from ..utils.norm import ChannelLayerNorm
 
 def conv_block(in_c, out_c, k=3, s=1, p=1):
     return nn.Sequential(
         nn.Conv3d(in_c, out_c, kernel_size=(1,k,k), stride=(1,s,s), padding=(0,p,p), bias=False),
-        nn.BatchNorm3d(out_c),
+        ChannelLayerNorm(out_c),
         nn.ReLU(inplace=True),
         nn.Conv3d(out_c, out_c, kernel_size=(1,k,k), stride=(1,1,1), padding=(0,p,p), bias=False),
-        nn.BatchNorm3d(out_c),
+        ChannelLayerNorm(out_c),
         nn.ReLU(inplace=True),
     )
 

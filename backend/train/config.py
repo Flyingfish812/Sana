@@ -67,8 +67,13 @@ DEFAULT_CFG: Dict[str, Any] = {
 def _deep_update(base: Dict, extra: Dict) -> Dict:
     out = copy.deepcopy(base)
     for k, v in (extra or {}).items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = _deep_update(out[k], v)
+        if isinstance(v, dict):
+            if v.get("__replace__"):
+                cleaned = {kk: vv for kk, vv in v.items() if kk != "__replace__"}
+                out[k] = _deep_update({}, cleaned)
+            else:
+                base_section = out.get(k, {}) if isinstance(out.get(k), dict) else {}
+                out[k] = _deep_update(base_section, v)
         else:
             out[k] = v
     return out

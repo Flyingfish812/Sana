@@ -193,14 +193,22 @@ def Sparse2DAdapter(sample: ArraySample, *,
 
     # 5) 输出
     y = np.transpose(target, (2,0,1))   # [C,H,W]
-    x = np.transpose(x_est, (2,0,1))    # [C,H,W]
+
+    # 构造包含重建、掩码以及原始采样值的 3 通道输入
+    recon = x_est[..., 0] if x_est.shape[-1] >= 1 else np.zeros((H, W), dtype=np.float32)
+    mask_img = np.zeros((H, W), dtype=np.float32)
+    mask_img[pts[:,0], pts[:,1]] = 1.0
+    masked = (target[..., 0] if target.shape[-1] >= 1 else np.zeros((H, W), dtype=target.dtype)) * mask_img
+    x = np.stack([
+        recon.astype(np.float32),
+        mask_img,
+        masked.astype(np.float32),
+    ], axis=0)
 
     cond = None
     if include_mask_in_cond or include_points_in_cond:
         cond = {}
         if include_mask_in_cond:
-            mask_img = np.zeros((H,W), dtype=np.float32)
-            mask_img[pts[:,0], pts[:,1]] = 1.0
             cond["mask"] = mask_img[None, ...]  # [1,H,W]
         if include_points_in_cond:
             cond["points"] = pts  # [M,2] (y,x)
