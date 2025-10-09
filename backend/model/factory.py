@@ -18,8 +18,11 @@ REGISTRY_TYPES = {
 # >>> 新增：内置组件模块清单（至少把最小可跑的那几个放进来）
 _BUILTIN_MODULES = [
     "backend.model.encoders.unet_base",
+    "backend.model.encoders.vit",
     "backend.model.propagators.identity",
+    "backend.model.propagators.vit",
     "backend.model.decoders.unet_decoder",
+    "backend.model.decoders.vit",
     "backend.model.heads.pixel_head",
 ]
 _BUILTINS_LOADED = False
