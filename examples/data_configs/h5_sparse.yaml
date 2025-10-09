@@ -22,8 +22,8 @@ transforms:
 adapter:
   kind: sparse2d
   mode: random
-  num_points: 20
-  seed: 123
+  num_points: 50
+  seed: 42
   nn_block_size: 16384        # 仅首次构建 idx_map 时使用
   reuse_points: per_dataset   # 关键：全数据集复用同一组随机点（极大提速）
   seed_per_time: false        # 不随 t 抖动 → 缓存命中
