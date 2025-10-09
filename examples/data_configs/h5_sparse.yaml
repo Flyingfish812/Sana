@@ -1,0 +1,54 @@
+# H5 数据 → 标准化 → NaN 填充 → 稀疏采样(IDW插值) → DataLoader → 快照存档
+reader:
+  kind: h5
+  path: ./testdata/2D_rdb_NA_NA_1pct.h5          # ← 你的 H5 文件
+  dataset: data                    # 或 ["var1","var2"] / 或使用 group: group: mygroup
+  times_key: times                 # 可选：若无可删
+  # fill_value: 0.0                # 若要在 Reader 层面粗填，可打开；通常用 transforms.fillna 更灵活
+
+sampler:
+  kind: per_frame
+  # t_stride: 1
+  # n: 0
+
+transforms:
+  # 先对 NaN 做处理，避免影响归一化/插值
+  fillna: { method: mean }         # 或 { method: value, value: -273.15 }
+  normalize: { method: zscore }
+  # add_coords: true
+  # add_time_encoding: true
+  # to_tensor: false               # 通常留给 collate 转 tensor
+
+adapter:
+  kind: sparse2d
+  mode: random
+  num_points: 20
+  seed: 123
+  nn_block_size: 16384        # 仅首次构建 idx_map 时使用
+  reuse_points: per_dataset   # 关键：全数据集复用同一组随机点（极大提速）
+  seed_per_time: false        # 不随 t 抖动 → 缓存命中
+  include_mask_in_cond: true
+  include_points_in_cond: true
+  # 若使用外部点击掩码：
+  # mode: mask
+  # mask_path: ./masks/h5_mask.json
+
+split:
+  enable: true
+  strategy: temporal   # or "random"
+  unit: frame          # or "sequence"
+  ratios: { train: 0.8, val: 0.1, test: 0.1 }
+  seed: 123
+
+batch_size: 8
+num_workers: 0
+shuffle: true
+
+output:
+  out_dir: ./prep_out/h5_sparse
+  save_array5d: true
+  snapshot:
+    enable: true
+    part_size_gb: 1.0              # 目标每片 ~1GB
+    gzip: false                    # 需要更小体积可设 true（.pt.gz）
+  overwrite: true

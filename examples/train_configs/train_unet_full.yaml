@@ -3,7 +3,7 @@
 # 适配我们当前的 EPD 模型与 train/ 侧代码
 # ==========================================================
 
-exp_name: "unet_baseline_epd"
+exp_name: &exp_name "unet_baseline_epd"
 
 # --------- 模型装配（EPDSystem：Encoder→Propagator→Decoder→Head）---------
 model:
@@ -57,7 +57,7 @@ trainer:
 logging:
   logger: "tensorboard"           # 也可 "csv" | "jsonl"
   save_dir: "runs"
-  name: "${exp_name}"             # 运行目录: runs/<exp_name>/<version>/
+  name: *exp_name             # 运行目录: runs/<exp_name>/<version>/
   version: null                   # 留空=自动用时间戳
 
 # --------- 回调：早停、Checkpoint、学习率、可视化、梯度范数 ---------

@@ -19,7 +19,7 @@ transforms:
 adapter:
   kind: sparse2d
   mode: random                    # random | mask
-  num_points: 20
+  num_points: 100
   seed: 123
   nn_block_size: 8192
   include_mask_in_cond: true      # 在 batch["cond"] 中得到 [B,1,H,W] 的采样掩码

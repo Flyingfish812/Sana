@@ -21,17 +21,16 @@ transforms:
 
 adapter:
   kind: sparse2d
-  mode: random
-  num_points: 20
-  seed: 123
-  nn_block_size: 16384        # 仅首次构建 idx_map 时使用
-  reuse_points: per_dataset   # 关键：全数据集复用同一组随机点（极大提速）
-  seed_per_time: false        # 不随 t 抖动 → 缓存命中
+  mode: mask                 # ← 用外部掩码，而不是随机点
+  mask_path: ./masks/h5_mask.json   # 或 ./masks/h5_mask.npy
+  nn_block_size: 16384
+  reuse_points: per_dataset  # 整个数据集重用同一组采样点（更快）
   include_mask_in_cond: true
   include_points_in_cond: true
-  # 若使用外部点击掩码：
-  # mode: mask
-  # mask_path: ./click_masks/h5_180x360.json
+  # ↓ 这几个与随机采样相关的参数在 mask 模式下可以删掉或留着也不影响
+  # num_points: 20
+  # seed: 123
+  # seed_per_time: false
 
 split:
   enable: true
@@ -45,7 +44,7 @@ num_workers: 0
 shuffle: true
 
 output:
-  out_dir: ./prep_out/h5_sparse
+  out_dir: ./prep_out/h5_mask
   save_array5d: true
   snapshot:
     enable: true

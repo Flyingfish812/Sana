@@ -12,7 +12,7 @@ model:
 
 # 训练与测试的固定参数（不是 lightning.Trainer）
 runner:
-  max_epochs: 2
+  max_epochs: 3
   log_every_n_steps: 10
   device: "auto"        # "cpu"|"cuda"| "auto"
   num_eval_batches: 3
