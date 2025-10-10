@@ -29,7 +29,7 @@ DEFAULT_CFG: Dict[str, Any] = {
     },
     "trainer": {
         "max_epochs": 50,
-        "precision": "32",
+        "precision": "bf16-mixed",
         "accelerator": "auto",
         "devices": "auto",
         "strategy": "auto",
