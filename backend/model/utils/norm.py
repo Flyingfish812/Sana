@@ -13,16 +13,25 @@ class ChannelLayerNorm(nn.Module):
         self.norm = nn.LayerNorm(num_channels, eps=eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # LayerNorm keeps its parameters in float32; make sure we normalise in
+        # that dtype and then restore the original precision so autocast can
+        # manage downstream ops.
+        input_dtype = x.dtype
+        norm_dtype = (
+            self.norm.weight.dtype
+            if self.norm.weight is not None
+            else input_dtype
+        )
         if x.ndim == 5:
             # [B,C,T,H,W] -> [B,T,H,W,C]
             x_perm = x.permute(0, 2, 3, 4, 1)
-            x_norm = self.norm(x_perm)
-            return x_norm.permute(0, 4, 1, 2, 3)
+            x_norm = self.norm(x_perm.to(dtype=norm_dtype))
+            return x_norm.to(dtype=input_dtype).permute(0, 4, 1, 2, 3)
         if x.ndim == 4:
             # [B,C,H,W] -> [B,H,W,C]
             x_perm = x.permute(0, 2, 3, 1)
-            x_norm = self.norm(x_perm)
-            return x_norm.permute(0, 3, 1, 2)
+            x_norm = self.norm(x_perm.to(dtype=norm_dtype))
+            return x_norm.to(dtype=input_dtype).permute(0, 3, 1, 2)
         raise ValueError(f"ChannelLayerNorm expects 4D or 5D input, got shape {tuple(x.shape)}")
 
 

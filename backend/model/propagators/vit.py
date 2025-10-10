@@ -10,6 +10,14 @@ from ..base_components.propagator_base import BasePropagator
 from ..factory import register
 
 
+def _apply_layer_norm(module: nn.LayerNorm, x: torch.Tensor) -> torch.Tensor:
+    """Run ``module`` in its parameter dtype while preserving the input dtype."""
+
+    input_dtype = x.dtype
+    norm_dtype = module.weight.dtype if module.weight is not None else input_dtype
+    return module(x.to(dtype=norm_dtype)).to(dtype=input_dtype)
+
+
 class DropPath(nn.Module):
     def __init__(self, drop_prob: float = 0.0):
         super().__init__()
@@ -70,10 +78,11 @@ class ViTBlock(nn.Module):
         self.drop_path2 = DropPath(droppath)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_norm = self.norm1(x)
+        x_norm = _apply_layer_norm(self.norm1, x)
         attn_out, _ = self.attn(x_norm, x_norm, x_norm, need_weights=False)
-        x = x + self.drop_path1(attn_out)
-        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+        x = x + self.drop_path1(attn_out.to(dtype=x.dtype))
+        mlp_out = self.mlp(_apply_layer_norm(self.norm2, x))
+        x = x + self.drop_path2(mlp_out.to(dtype=x.dtype))
         return x
 
 
@@ -118,6 +127,6 @@ class ViTPropagator(BasePropagator):
         tokens = x5.permute(0, 2, 3, 4, 1).reshape(b * t, h * w, c)
         for block in self.blocks:
             tokens = block(tokens)
-        tokens = self.norm(tokens)
+        tokens = _apply_layer_norm(self.norm, tokens)
         tokens = tokens.reshape(b, t, h, w, c).permute(0, 4, 1, 2, 3)
         return tokens
