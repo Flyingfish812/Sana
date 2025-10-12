@@ -20,10 +20,12 @@ model:
 # --------- 数据 ---------
 data:
   from_run_dir: "prep_out/h5_sparse"  # ← 指向“上一存档点”的 run 目录
-  batch_size: 8
-  num_workers: 4
+  batch_size: 16
+  num_workers: 8
   pin_memory: true
   persistent_workers: true
+  prefetch_factor: 4
+  drop_last: false
   save_dataloaders: true  # 开启后，这一轮也会把 dataloaders 存到自己的 run 目录
 
 # data:
@@ -38,7 +40,8 @@ data:
 
 # --------- Trainer 配置（Lightning）---------
 trainer:
-  max_epochs: 5
+  max_epochs: null
+  max_steps: 10000
   precision: "16-mixed"           # 可选: "32" | "bf16-mixed"
   accelerator: "auto"
   devices: "auto"

@@ -25,10 +25,13 @@ DEFAULT_CFG: Dict[str, Any] = {
         "num_workers": 4,
         "pin_memory": True,
         "persistent_workers": True,
+        "prefetch_factor": 4,
+        "drop_last": False,
         "save_dataloaders": False # 开启后会把本次 dataloaders 快照保存到本 run 目录
     },
     "trainer": {
-        "max_epochs": 50,
+        "max_epochs": None,
+        "max_steps": 10000,
         "precision": "32",
         "accelerator": "auto",
         "devices": "auto",

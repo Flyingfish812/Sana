@@ -35,10 +35,12 @@ data:
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 4
+  drop_last: false
   save_dataloaders: true
 
 trainer:
-  max_epochs: 10
+  max_epochs: null
+  max_steps: 12000
   precision: "16-mixed"
   accelerator: "gpu"
   devices: "auto"

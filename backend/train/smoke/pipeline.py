@@ -30,6 +30,7 @@ def basic_fit(
     device: torch.device,
     out_dir: Path,
     epochs: int = 2,
+    max_steps: int | None = None,
 ) -> None:
     model.to(device)
     opt_cfg = model.configure_optimizers()
@@ -75,6 +76,12 @@ def basic_fit(
                 log_fp.write(json.dumps(rec) + "\n")
                 log_fp.flush()
                 print(rec)
+
+            if max_steps is not None and global_step >= max_steps:
+                break
+
+        if max_steps is not None and global_step >= max_steps:
+            break
 
         train_mean = float(sum(train_losses) / len(train_losses)) if train_losses else None
         val_mean = None
@@ -145,8 +152,10 @@ def run_smoke(
     save_model_summary(model, first_batch, out_dir)
 
     device = _select_device(cfg["runner"].get("device", "auto"))
-    epochs = cfg["runner"].get("max_epochs", 2)
-    basic_fit(model, train_dl, val_dl, device, out_dir, epochs=epochs)
+    runner_cfg = cfg.get("runner", {})
+    epochs = runner_cfg.get("max_epochs", 2)
+    steps = runner_cfg.get("max_steps")
+    basic_fit(model, train_dl, val_dl, device, out_dir, epochs=epochs, max_steps=steps)
 
     last_ckpt = out_dir / "model_last.pt"
     torch.save({"state_dict": model.state_dict()}, last_ckpt)
