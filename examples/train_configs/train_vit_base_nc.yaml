@@ -29,15 +29,18 @@ model:
   reg_weights: { encoder: 0.0, propagator: 0.0, decoder: 0.0, head: 0.0 }
 
 data:
-  from_run_dir: "prep_out/mat_sparse"
-  batch_size: 8
-  num_workers: 4
+  from_run_dir: "prep_out/nc_sparse"
+  batch_size: 12
+  num_workers: 8
   pin_memory: true
   persistent_workers: true
+  prefetch_factor: 4
+  drop_last: false
   save_dataloaders: true
 
 trainer:
-  max_epochs: 5
+  max_epochs: null
+  max_steps: 6000
   precision: "16-mixed"
   accelerator: "auto"
   devices: "auto"

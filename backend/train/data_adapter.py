@@ -21,8 +21,24 @@ def _with_loader_opts(dl: DataLoader, cfg: Dict) -> DataLoader:
         pin_memory=cfg.get("pin_memory", True),
         persistent_workers=cfg.get("persistent_workers", False),
         shuffle=getattr(dl, "shuffle", False),
+        drop_last=cfg.get("drop_last", getattr(dl, "drop_last", False)),
     )
-    return DataLoader(dl.dataset, shuffle=opts.pop("shuffle"), collate_fn=dl.collate_fn, **opts)
+
+    num_workers = opts["num_workers"] or 0
+    if num_workers <= 0:
+        opts["persistent_workers"] = False
+    else:
+        prefetch = cfg.get("prefetch_factor", getattr(dl, "prefetch_factor", None))
+        if prefetch is not None:
+            opts["prefetch_factor"] = prefetch
+
+    shuffle = opts.pop("shuffle")
+    return DataLoader(
+        dl.dataset,
+        shuffle=shuffle,
+        collate_fn=dl.collate_fn,
+        **opts,
+    )
 
 def _build_via_builder(builder: str, builder_args: Dict) -> Tuple[DataLoader, Optional[DataLoader], DataLoader]:
     module, fn = builder.split(":")
@@ -89,6 +105,8 @@ def _save_loader_meta(dl: DataLoader, path: Path, tag: str):
         "num_workers": getattr(dl, "num_workers", None),
         "pin_memory": getattr(dl, "pin_memory", None),
         "persistent_workers": getattr(dl, "persistent_workers", None),
+        "prefetch_factor": getattr(dl, "prefetch_factor", None),
+        "drop_last": getattr(dl, "drop_last", None),
         "sampler": dl.sampler.__class__.__name__ if hasattr(dl, "sampler") else None,
         "collate_fn": None,
     }

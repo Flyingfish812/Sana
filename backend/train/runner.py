@@ -32,7 +32,7 @@ def build_model_from_cfg(model_cfg: Dict) -> EPDSystem:
 def _trainer_from_cfg(cfg: Dict, loggers, callbacks):
     tcfg = cfg["trainer"]
     safe_keys = {
-        "max_epochs","precision","accelerator","devices","strategy",
+        "max_epochs","max_steps","precision","accelerator","devices","strategy",
         "log_every_n_steps","val_check_interval","gradient_clip_val",
         "accumulate_grad_batches","deterministic","benchmark","num_sanity_val_steps",
         "enable_checkpointing","enable_model_summary","limit_train_batches",
@@ -55,7 +55,24 @@ def run_training(
     
     """支持：显式注入 dataloaders 或按 cfg.data 自动读取"""
     cfg = load_config(cfg)
-    seed_everything(cfg["train"]["seed"], deterministic=cfg["trainer"].get("deterministic", True))
+    strategy = cfg["trainer"].get("strategy")
+    strategy_name = strategy.lower() if isinstance(strategy, str) else ""
+
+    spawn_like = strategy_name in {"ddp_notebook", "ddp_spawn"}
+    if spawn_like:
+        import torch.multiprocessing as mp
+
+        try:
+            mp.set_start_method("spawn", force=True)
+        except RuntimeError:
+            # The context might already be initialised; ignore in that case.
+            pass
+
+    seed_everything(
+        cfg["train"]["seed"],
+        deterministic=cfg["trainer"].get("deterministic", True),
+        skip_cuda_seed=spawn_like,
+    )
 
     run_dir = prepare_run_dir(cfg)
     loggers = build_loggers(cfg["logging"], run_dir)

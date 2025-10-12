@@ -30,14 +30,17 @@ model:
 
 data:
   from_run_dir: "prep_out/h5_mask"
-  batch_size: 8
-  num_workers: 4
+  batch_size: 16
+  num_workers: 8
   pin_memory: true
   persistent_workers: true
+  prefetch_factor: 4
+  drop_last: false
   save_dataloaders: true
 
 trainer:
-  max_epochs: 5
+  max_epochs: null
+  max_steps: 8000
   precision: "16-mixed"
   accelerator: "auto"
   devices: "auto"
