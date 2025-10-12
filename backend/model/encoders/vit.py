@@ -32,8 +32,20 @@ class PatchEmbed2D(nn.Module):
                 "Input spatial dimensions must be divisible by patch size. "
                 f"Got H={h}, W={w}, patch_size={self.patch_size}."
             )
-        return self.proj(x)
+        in_dtype = x.dtype
 
+        # ① 确保权重和输入在同一设备（Lightning 有时因“懒构建/子模块晚注册”漏搬）
+        if self.proj.weight.device != x.device:
+            self.proj = self.proj.to(x.device)
+
+        # ② 关闭 autocast，③ dtype 与权重一致
+        if torch.is_autocast_enabled():
+            with torch.amp.autocast('cuda', enabled=False):
+                out = self.proj(x.to(dtype=self.proj.weight.dtype))
+        else:
+            out = self.proj(x.to(dtype=self.proj.weight.dtype))
+
+        return out.to(dtype=in_dtype)  # 还原回原 dtype
 
 @register("encoder", "ViTEncoder")
 class ViTEncoder(BaseEncoder):

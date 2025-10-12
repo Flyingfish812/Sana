@@ -31,4 +31,16 @@ class _PixelHead(BaseHead):
     def forward(self, x5: torch.Tensor, **kwargs) -> torch.Tensor:
         if not self._lazy_built:
             self._lazy_build(x5.shape[1])
-        return self.conv(x5)
+            # 懒构建后立刻搬到输入设备，避免默认落 CPU
+            self.conv = self.conv.to(x5.device)
+
+        in_dtype = x5.dtype
+        if self.conv.weight.device != x5.device:
+            self.conv = self.conv.to(x5.device)
+
+        if torch.is_autocast_enabled():
+            with torch.amp.autocast('cuda', enabled=False):
+                y = self.conv(x5.to(dtype=self.conv.weight.dtype))
+        else:
+            y = self.conv(x5.to(dtype=self.conv.weight.dtype))
+        return y.to(in_dtype)

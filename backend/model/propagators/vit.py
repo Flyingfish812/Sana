@@ -70,12 +70,36 @@ class ViTBlock(nn.Module):
         self.drop_path2 = DropPath(droppath)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_norm = self.norm1(x)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm, need_weights=False)
-        x = x + self.drop_path1(attn_out)
-        x = x + self.drop_path2(self.mlp(self.norm2(x)))
-        return x
+        in_dtype = x.dtype
 
+        # 保证子模块和输入在同一设备（极小改动，但能治“CPU 权重 vs CUDA 输入”）
+        if self.attn.in_proj_weight.device != x.device:
+            self.attn = self.attn.to(x.device)
+        if self.mlp.fc1.weight.device != x.device:
+            self.mlp = self.mlp.to(x.device)
+
+        # Attention
+        x_norm = self.norm1(x)  # 你的 LN 内部已有精度保护
+        attn_w_dtype = self.attn.in_proj_weight.dtype
+        if torch.is_autocast_enabled():
+            with torch.amp.autocast('cuda', enabled=False):
+                q = x_norm.to(dtype=attn_w_dtype)
+                attn_out, _ = self.attn(q, q, q, need_weights=False)
+        else:
+            q = x_norm.to(dtype=attn_w_dtype)
+            attn_out, _ = self.attn(q, q, q, need_weights=False)
+        x = x + self.drop_path1(attn_out.to(in_dtype))
+
+        # MLP
+        mlp_in = self.norm2(x)
+        mlp_w_dtype = self.mlp.fc1.weight.dtype
+        if torch.is_autocast_enabled():
+            with torch.amp.autocast('cuda', enabled=False):
+                mlp_out = self.mlp(mlp_in.to(dtype=mlp_w_dtype))
+        else:
+            mlp_out = self.mlp(mlp_in.to(dtype=mlp_w_dtype))
+        x = x + self.drop_path2(mlp_out.to(in_dtype))
+        return x
 
 @register("propagator", "ViTTransformer")
 class ViTPropagator(BasePropagator):

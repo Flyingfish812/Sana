@@ -41,7 +41,17 @@ class ViTDecoder(BaseDecoder):
         self.norm = ChannelLayerNorm(self.out_channels)
 
     def forward(self, x5: torch.Tensor, skips=None) -> torch.Tensor:
-        x = self.proj(x5)
+        in_dtype = x5.dtype
+        if self.proj.weight.device != x5.device:
+            self.proj = self.proj.to(x5.device)
+
+        if torch.is_autocast_enabled():
+            with torch.amp.autocast('cuda', enabled=False):
+                x = self.proj(x5.to(dtype=self.proj.weight.dtype))
+        else:
+            x = self.proj(x5.to(dtype=self.proj.weight.dtype))
+
+        x = x.to(in_dtype)
         x = self.dropout(x)
         x = self.norm(x)
         return x
