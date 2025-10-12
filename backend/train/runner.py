@@ -47,6 +47,12 @@ def run_training(
     val_dl: Optional[DataLoader] = None,
     test_dl: Optional[DataLoader] = None,
 ) -> Tuple[EPDSystem, Dict[str, str]]:
+    import torch
+    try:
+        torch.set_float32_matmul_precision("high")  # 等价于允许 TF32
+    except Exception:
+        pass
+    
     """支持：显式注入 dataloaders 或按 cfg.data 自动读取"""
     cfg = load_config(cfg)
     seed_everything(cfg["train"]["seed"], deterministic=cfg["trainer"].get("deterministic", True))

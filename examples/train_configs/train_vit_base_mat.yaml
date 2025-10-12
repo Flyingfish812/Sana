@@ -30,27 +30,28 @@ model:
 
 data:
   snapshot_dir: "prep_out/mat_sparse"
-  batch_size: 8
-  num_workers: 4
+  batch_size: 16
+  num_workers: 8
   pin_memory: true
   persistent_workers: true
+  prefetch_factor: 4
   save_dataloaders: true
 
 trainer:
-  max_epochs: 5
+  max_epochs: 10
   precision: "16-mixed"
-  accelerator: "auto"
+  accelerator: "gpu"
   devices: "auto"
   strategy: "auto"
   log_every_n_steps: 10
-  val_check_interval: 0.25
+  val_check_interval: 1.0
   gradient_clip_val: 0.0
   accumulate_grad_batches: 1
-  deterministic: true
-  benchmark: false
-  num_sanity_val_steps: 2
+  deterministic: false
+  benchmark: true
+  num_sanity_val_steps: 0
   enable_checkpointing: true
-  enable_model_summary: true
+  enable_model_summary: false
 
 logging:
   logger: "tensorboard"

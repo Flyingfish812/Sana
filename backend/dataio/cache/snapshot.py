@@ -302,7 +302,7 @@ def load_snapshot_as_dataloader(
         stacked: Dict[str, torch.Tensor] = {k: torch.cat(vs, dim=0) for k, vs in buffers.items() if len(vs) > 0}
         # 构建 in-memory dataset
         ds = _InMemoryTensorDataset(**stacked)
-        dl = DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+        dl = DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, **loader_kwargs)
         return dl, {"mode": "in_memory", "num_samples": len(ds), "parts": len(parts)}
     else:
         # ---- streaming：IterableDataset 不支持 shuffle，忽略任何 shuffle 请求 ----
