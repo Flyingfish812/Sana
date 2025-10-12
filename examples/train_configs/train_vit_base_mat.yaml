@@ -29,7 +29,7 @@ model:
   reg_weights: { encoder: 0.0, propagator: 0.0, decoder: 0.0, head: 0.0 }
 
 data:
-  from_run_dir: "prep_out/mat_sparse"
+  snapshot_dir: "prep_out/mat_sparse"
   batch_size: 8
   num_workers: 4
   pin_memory: true

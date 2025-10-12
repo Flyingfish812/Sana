@@ -7,9 +7,17 @@ import json
 import math
 import io
 import gzip
-
+import warnings
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
+
+def _safe_torch_load(obj, *, map_location="cpu"):
+    try:
+        # 新版 PyTorch：优先走安全模式
+        return torch.load(obj, map_location=map_location, weights_only=True)
+    except TypeError:
+        # 旧版 PyTorch：没有 weights_only 参数，回退
+        return torch.load(obj, map_location=map_location)
 
 # --------------------
 # 工具：张量体积估算
@@ -241,6 +249,7 @@ def load_snapshot_as_dataloader(
     max_ram_gb: Optional[float] = None,
     force_streaming: bool = False,
     shuffle: bool = False,
+    **loader_kwargs,
 ) -> Tuple[DataLoader, Dict[str, Any]]:
     """
     从快照目录恢复 DataLoader。
@@ -248,6 +257,14 @@ def load_snapshot_as_dataloader(
       - 否则返回流式 IterableDataset → DataLoader（分片顺序读取）
     返回 (dataloader, info)；info 中含 "mode": "in_memory"|"streaming"
     """
+    for k in ("batch_size", "shuffle", "num_workers"):
+        if k in loader_kwargs:
+            loader_kwargs.pop(k)
+    # 低开销保护：当 num_workers==0 时，避免 DataLoader 因不合法组合报错
+    if num_workers == 0:
+        loader_kwargs.pop("persistent_workers", None)
+        loader_kwargs.pop("prefetch_factor", None)
+    
     p = Path(dir_path)
     idx_path = p / "snapshot_index.json"
     if not idx_path.exists():
@@ -264,9 +281,9 @@ def load_snapshot_as_dataloader(
     def _bytes_to_gb(b: int) -> float:
         return b / (1 << 30)
 
-    can_in_memory = False
-    if not force_streaming and max_ram_gb is not None:
-        can_in_memory = (_bytes_to_gb(total_bytes) <= max_ram_gb)
+    can_in_memory = (not force_streaming) and (
+        (max_ram_gb is None) or (_bytes_to_gb(total_bytes) <= max_ram_gb)
+    )
 
     if can_in_memory and len(parts) > 0:
         # 一次性读入所有分片，拼成大张量
@@ -276,9 +293,9 @@ def load_snapshot_as_dataloader(
             fp = p / fn
             if compressed:
                 with gzip.open(fp, "rb") as gz:
-                    payload = torch.load(io.BytesIO(gz.read()), map_location="cpu")
+                    payload = _safe_torch_load(io.BytesIO(gz.read()), map_location="cpu")
             else:
-                payload = torch.load(fp, map_location="cpu")
+                payload = _safe_torch_load(fp, map_location="cpu")
             for k in keys:
                 buffers[k].append(payload[k])
         # cat -> big tensors
@@ -288,9 +305,11 @@ def load_snapshot_as_dataloader(
         dl = DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
         return dl, {"mode": "in_memory", "num_samples": len(ds), "parts": len(parts)}
     else:
-        # 低内存流式
+        # ---- streaming：IterableDataset 不支持 shuffle，忽略任何 shuffle 请求 ----
+        if shuffle:
+            warnings.warn("IterableDataset 不支持 shuffle；已忽略 shuffle=True。", RuntimeWarning)
         ds = _ShardIterator(str(p), parts, compressed)
-        dl = DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+        dl = DataLoader(ds, batch_size=batch_size, num_workers=num_workers, **loader_kwargs)  # 不传 shuffle
         return dl, {"mode": "streaming", "parts": len(parts)}
 
 # --------------------

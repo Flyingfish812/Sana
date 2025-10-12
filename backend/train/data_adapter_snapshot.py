@@ -1,40 +1,81 @@
 # backend/train/data_adapter_snapshot.py
 from __future__ import annotations
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 from pathlib import Path
 import glob
 import json
 import torch
-from torch.utils.data import DataLoader
+import gzip
+import io
+from torch.utils.data import DataLoader, TensorDataset
 
 def _load_split_loader(split_dir: Path, loader_cfg: Dict) -> Optional[DataLoader]:
-    # 1) 你的 dataio 原生导出的 DataLoader 片段
-    pt_list = sorted(glob.glob(str(split_dir / "dl.part*.pt")))
-    if pt_list:
-        obj = torch.load(pt_list[0], map_location="cpu")
-        if isinstance(obj, DataLoader):
-            return obj
-        try:
-            from torch.utils.data import Dataset
-            if isinstance(obj, Dataset):
-                return DataLoader(
-                    obj,
-                    batch_size=loader_cfg.get("batch_size", 8),
-                    num_workers=loader_cfg.get("num_workers", 4),
-                    pin_memory=loader_cfg.get("pin_memory", True),
-                    persistent_workers=loader_cfg.get("persistent_workers", False),
-                    shuffle=("train" in split_dir.name.lower()),
-                )
-        except Exception:
-            pass
+    """
+    加载单个 split (train/val/test) 的 DataLoader。
+    优先顺序：
+      (1) snapshot_index.json  → 调用数据层读取器（标准恢复）；
+      (2) 兜底：目录下存在 dl.part*.pt[.gz] 但没有 snapshot_index.json → 手工拼接成 TensorDataset；
+      (3) 训练侧 fallback：{split}_dataset.pt → 直接还原成 DataLoader。
+    """
+    # -------- (1) 标准：snapshot_index.json --------
+    snap_idx = split_dir / "snapshot_index.json"
+    if snap_idx.exists():
+        # 直接复用数据层快照读取器（这是 DataloaderSnapshotWriter 的正向配套读取）
+        from backend.dataio.cache.snapshot import load_snapshot_as_dataloader
+        dl, _ = load_snapshot_as_dataloader(
+            str(split_dir),
+            batch_size=loader_cfg.get("batch_size", 8),
+            num_workers=loader_cfg.get("num_workers", 4),
+            shuffle=("train" in split_dir.name.lower()),
+            pin_memory=loader_cfg.get("pin_memory", True),
+            persistent_workers=loader_cfg.get("persistent_workers", False),
+        )
+        return dl
 
-    # 2) 我们训练侧保存的 dataset.pt
+    # -------- (2) 兜底：没有 snapshot_index.json，但有分片文件 → 手工拼接 --------
+    # 同时匹配 .pt 和 .pt.gz；按文件名排序确保顺序一致
+    part_files: List[str] = sorted(
+        glob.glob(str(split_dir / "dl.part*.pt")) +
+        glob.glob(str(split_dir / "dl.part*.pt.gz"))
+    )
+    if part_files:
+        xs: List[torch.Tensor] = []
+        ys: List[torch.Tensor] = []
+        cs: List[torch.Tensor] = []
+        for fp in part_files:
+            if fp.endswith(".gz"):
+                with gzip.open(fp, "rb") as gz:
+                    payload = torch.load(io.BytesIO(gz.read()), map_location="cpu")
+            else:
+                payload = torch.load(fp, map_location="cpu")
+            # 分片约定是 dict，键来自 {"x","y","cond"}（与写入器约定一致）
+            x, y, c = payload.get("x"), payload.get("y"), payload.get("cond")
+            if isinstance(x, torch.Tensor): xs.append(x)
+            if isinstance(y, torch.Tensor): ys.append(y)
+            if isinstance(c, torch.Tensor): cs.append(c)
+
+        tensors: List[torch.Tensor] = []
+        if xs: tensors.append(torch.cat(xs, dim=0))
+        if ys: tensors.append(torch.cat(ys, dim=0))
+        if cs: tensors.append(torch.cat(cs, dim=0))
+        if not tensors:
+            return None  # 没有任何张量就返回空，交由上层报错
+
+        ds = TensorDataset(*tensors)
+        return DataLoader(
+            ds,
+            batch_size=loader_cfg.get("batch_size", 8),
+            num_workers=loader_cfg.get("num_workers", 4),
+            pin_memory=loader_cfg.get("pin_memory", True),
+            persistent_workers=loader_cfg.get("persistent_workers", False),
+            shuffle=("train" in split_dir.name.lower()),
+        )
+
+    # -------- (3) 训练侧 fallback：{split}_dataset.pt --------
     ds_pt = split_dir / f"{split_dir.name}_dataset.pt"
     if ds_pt.exists():
         obj = torch.load(ds_pt, map_location="cpu")
-        # 兼容保存的两种形态
         if isinstance(obj, dict) and obj.get("__type__") == "TensorDataset":
-            from torch.utils.data import TensorDataset
             obj = TensorDataset(*obj["tensors"])
         return DataLoader(
             obj,
@@ -44,6 +85,7 @@ def _load_split_loader(split_dir: Path, loader_cfg: Dict) -> Optional[DataLoader
             persistent_workers=loader_cfg.get("persistent_workers", False),
             shuffle=("train" in split_dir.name.lower()),
         )
+
     return None
 
 def _detect_root(snapshot_dir: Path) -> Path:
