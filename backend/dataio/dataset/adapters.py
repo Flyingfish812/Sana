@@ -2,7 +2,7 @@
 from __future__ import annotations
 import numpy as np
 import math
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Sequence
 from ..schema import ArraySample, AdapterOutput
 from ..registry import register_adapter
 
@@ -122,35 +122,73 @@ def _interp_1nn(H: int, W: int,
     return out.reshape(H, W, values.shape[1]).astype(np.float32)
 
 @register_adapter("sparse2d")
-def Sparse2DAdapter(sample: ArraySample, *,
-                    mode: str = "random",           # "random" | "mask"
-                    num_points: int = 1024,
-                    seed: int = 42,
-                    mask_path: Optional[str] = None,
-                    nn_block_size: int = 16384,
-                    include_mask_in_cond: bool = True,
-                    include_points_in_cond: bool = True,
-                    avoid_nan: bool = True,
-                    reuse_points: str = "per_dataset",   # "none"|"per_dataset"|"per_mask"
-                    seed_per_time: bool = False) -> AdapterOutput:
+def Sparse2DAdapter(
+    sample: ArraySample, *,
+    mode: str = "random",                 # "random" | "mask"
+    num_points: int = 1024,
+    seed: int = 42,
+    mask_path: Optional[str] = None,
+    nn_block_size: int = 16384,
+    include_mask_in_cond: bool = True,
+    include_points_in_cond: bool = True,
+    avoid_nan: bool = True,
+    reuse_points: str = "per_dataset",    # "none" | "per_dataset" | "per_mask"
+    seed_per_time: bool = False,
+    # —— 新增参数（用于通道选择/兼容 NC 的多通道）——
+    # 基准通道：用于构造 recon / masked 的“基底”通道；可为 int 索引或通道名（如 "omega"）
+    base_channel: Optional[object] = None,
+    # 监督目标通道选择：None=保留所有（旧行为）；可为索引或通道名列表（如 ["omega"]）
+    target_channels: Optional[Sequence[object]] = None,
+    # 追加到输入 x 的额外原始通道（例如把 ["u","v"] 也拼入输入）
+    extra_input_channels: Optional[Sequence[object]] = None,
+) -> AdapterOutput:
     """
-    稀疏采样 + 1-NN 插值（极致加速版）：
-      - 通过缓存 idx_map[H,W]（像素→最近采样点索引）避免对每个样本重复做距离搜索
-      - 默认 reuse_points="per_dataset" 且 seed_per_time=False → 整个数据集复用同一组随机点
+    稀疏采样 + 1-NN 插值（带可配置通道选择）：
+      - 依旧输出“三件套”输入：recon(masked by base_channel)、mask、masked(base_channel)
+      - 可选把若干原始通道（如 u,v）拼到输入 x
+      - y 默认保留全部通道（与旧行为一致）；在 NC 任务下可只保留 ["omega"]
     """
-    frames = sample.frames            # [K,H,W,C]
-    target = frames[-1]               # [H,W,C]
+    # ---------- 基础读取 ----------
+    frames = sample.frames              # [K,H,W,C]
+    target = frames[-1]                 # [H,W,C] 监督基准帧
     H, W, C = target.shape
+    meta = sample.meta
+    chan_names = list((meta.attrs or {}).get("channels", []))  # 可能是 ["u","v","omega"]，也可能为空
 
-    # 1) 可采样区域
-    finite = _finite_mask(target) if avoid_nan else np.ones((H,W), dtype=bool)
+    # ---------- 工具：把“索引或名字”解析成索引列表 ----------
+    def _indices_from_spec(spec: Optional[Sequence[object] | object]) -> Optional[list[int]]:
+        if spec is None:
+            return None
+        if isinstance(spec, (int, np.integer, str)):
+            spec = [spec]
+        out: list[int] = []
+        name2idx = {n: i for i, n in enumerate(chan_names)}
+        for w in spec:
+            if isinstance(w, (int, np.integer)):
+                idx = int(w)
+                if not (0 <= idx < C):
+                    raise IndexError(f"channel index {idx} out of range 0..{C-1}")
+                out.append(idx)
+            elif isinstance(w, str):
+                if w not in name2idx:
+                    raise KeyError(f"channel name '{w}' not in {chan_names or '[unnamed channels]'}")
+                out.append(int(name2idx[w]))
+            else:
+                raise TypeError(f"unsupported channel spec: {type(w)} -> {w}")
+        return out
 
-    # 2) 采样点
+    base_idx = 0 if base_channel is None else _indices_from_spec(base_channel)[0]
+    tgt_inds = _indices_from_spec(target_channels)             # e.g. ["omega"] -> [2]
+    extra_inds = _indices_from_spec(extra_input_channels)      # e.g. ["u","v"] -> [0,1]
+
+    # ---------- 1) 可采样区域 ----------
+    finite = _finite_mask(target) if avoid_nan else np.ones((H, W), dtype=bool)
+
+    # ---------- 2) 采样点 ----------
     if mode == "random":
         ys, xs = np.where(finite)
         if ys.size == 0:
-            ys, xs = np.indices((H,W)).reshape(2, -1)
-        # 控制是否随时间抖动
+            ys, xs = np.indices((H, W)).reshape(2, -1)
         time_bump = (sample.spec.get("t", [-1])[-1] if (isinstance(sample.spec, dict) and seed_per_time) else 0)
         rng = np.random.RandomState(seed + int(time_bump))
         M = min(num_points, ys.size)
@@ -166,54 +204,59 @@ def Sparse2DAdapter(sample: ArraySample, *,
     else:
         raise ValueError(f"Unknown sparse mode: {mode}")
 
-    # 3) 构造/获取 idx_map（像素→最近采样点索引），带缓存
+    # ---------- 3) 最近邻索引图（像素→最近采样点）+ 缓存 ----------
     cache_key = None
     if reuse_points == "per_dataset":
         cache_key = _hash_points(pts, H, W)
     elif reuse_points == "per_mask":
-        mh = hashlib.blake2b(digest_size=16); mh.update(finite.astype(np.uint8).tobytes()); mh.update(np.int64(H).tobytes()); mh.update(np.int64(W).tobytes())
+        mh = hashlib.blake2b(digest_size=16)
+        mh.update(finite.astype(np.uint8).tobytes())
+        mh.update(np.int64(H).tobytes()); mh.update(np.int64(W).tobytes())
         cache_key = mh.hexdigest()
-    # else: reuse_points == "none" → 每次不缓存
 
-    idx_map = None
     if cache_key is not None and cache_key in _IDX_MAP_CACHE:
         idx_map = _IDX_MAP_CACHE[cache_key]
     else:
-        # 计算 1-NN 索引图
         idx_map = _compute_idx_map_1nn(H, W, pts, block_size=nn_block_size)
         if cache_key is not None:
-            # 简易 LRU：超限则弹出最早的
             if len(_IDX_MAP_CACHE) >= _IDX_MAP_CAP:
                 _IDX_MAP_CACHE.pop(next(iter(_IDX_MAP_CACHE)))
             _IDX_MAP_CACHE[cache_key] = idx_map
 
-    # 4) 采样值 + 直接映射生成估计图（O(HW)）
-    vals = target[pts[:,0], pts[:,1], :].astype(np.float32)  # [M,C]
-    x_est = vals[idx_map]                                    # [H,W,C]
+    # ---------- 4) 基于采样点的 1NN 重建 ----------
+    vals = target[pts[:, 0], pts[:, 1], :].astype(np.float32)  # [M,C]
+    x_est = vals[idx_map]                                      # [H,W,C]
 
-    # 5) 输出
-    y = np.transpose(target, (2,0,1))   # [C,H,W]
-
-    # 构造包含重建、掩码以及原始采样值的 3 通道输入
-    recon = x_est[..., 0] if x_est.shape[-1] >= 1 else np.zeros((H, W), dtype=np.float32)
+    # ---------- 5) 组装 x（三件套 + 额外通道） ----------
+    # 三件套基于 base_idx：recon(base)、mask、masked(base)
+    recon  = x_est[..., base_idx].astype(np.float32)           # [H,W]
     mask_img = np.zeros((H, W), dtype=np.float32)
-    mask_img[pts[:,0], pts[:,1]] = 1.0
-    masked = (target[..., 0] if target.shape[-1] >= 1 else np.zeros((H, W), dtype=target.dtype)) * mask_img
-    x = np.stack([
-        recon.astype(np.float32),
-        mask_img,
-        masked.astype(np.float32),
-    ], axis=0)
+    mask_img[pts[:, 0], pts[:, 1]] = 1.0
+    masked = target[..., base_idx].astype(np.float32) * mask_img
 
+    x_list = [recon[None, ...], mask_img[None, ...], masked[None, ...]]  # [3,H,W]
+    if extra_inds:
+        # 把目标帧的原始若干通道（如 u,v）拼到输入
+        # 注意：这里直接用目标帧的原值（不是重建值），以提供更强的条件信息
+        x_list.append(np.transpose(target[..., extra_inds], (2, 0, 1)).astype(np.float32))  # [n_extra,H,W]
+    x = np.concatenate(x_list, axis=0)  # [3(+n_extra), H, W]
+
+    # ---------- 6) 组装 y（可裁通道；默认旧行为=保留全部） ----------
+    if tgt_inds:
+        y = np.transpose(target[..., tgt_inds], (2, 0, 1)).astype(np.float32)  # 只保留选定通道
+    else:
+        y = np.transpose(target, (2, 0, 1)).astype(np.float32)                 # 旧行为：全通道
+
+    # ---------- 7) cond 打包（可选） ----------
     cond = None
     if include_mask_in_cond or include_points_in_cond:
         cond = {}
         if include_mask_in_cond:
-            cond["mask"] = mask_img[None, ...]  # [1,H,W]
+            cond["mask"] = mask_img[None, ...]   # [1,H,W]
         if include_points_in_cond:
-            cond["points"] = pts  # [M,2] (y,x)
+            cond["points"] = pts                 # [M,2] (y,x)
 
-    return AdapterOutput(x=x, y=y, cond=cond, meta=sample.meta)
+    return AdapterOutput(x=x, y=y, cond=cond, meta=meta)
 
 # --- helper: 读取点击掩码 ---
 def _load_click_mask(path: str, H: int, W: int) -> np.ndarray:

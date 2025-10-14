@@ -29,7 +29,7 @@ model:
   reg_weights: { encoder: 0.0, propagator: 0.0, decoder: 0.0, head: 0.0 }
 
 data:
-  from_run_dir: "prep_out/h5_mask"
+  snapshot_dir: "prep_out/h5_sparse"
   batch_size: 16
   num_workers: 8
   pin_memory: true
@@ -40,17 +40,17 @@ data:
 
 trainer:
   max_epochs: null
-  max_steps: 8000
+  max_steps: 5000
   precision: "16-mixed"
   accelerator: "auto"
   devices: "auto"
   strategy: "auto"
   log_every_n_steps: 10
-  val_check_interval: 0.25
+  val_check_interval: 1.0
   gradient_clip_val: 0.0
   accumulate_grad_batches: 1
-  deterministic: true
-  benchmark: false
+  deterministic: false
+  benchmark: true
   num_sanity_val_steps: 2
   enable_checkpointing: true
   enable_model_summary: true

@@ -132,9 +132,9 @@ class NCReader(BaseReader):
         shape = list(arr.shape)
 
         # 候选名
-        t_names = [time_key, "time", "t"]
-        y_names = [y_key, "lat", "y"]
-        x_names = [x_key, "lon", "x"]
+        t_names = [time_key, "tdim", "time", "t"]
+        y_names = [y_key, "ydim", "lat", "y"]
+        x_names = [x_key, "xdim", "lon", "x"]
 
         def pick_axis_by_name(names):
             for n in names:

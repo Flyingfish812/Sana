@@ -2,7 +2,7 @@
 # Vision Transformer baseline assembled via the EPD system
 # ==========================================================
 
-exp_name: &exp_name "vit_base_epd"
+exp_name: &exp_name "vit_base_epd_mat"
 
 model:
   encoder:
@@ -40,7 +40,7 @@ data:
 
 trainer:
   max_epochs: null
-  max_steps: 12000
+  max_steps: 1200
   precision: "16-mixed"
   accelerator: "gpu"
   devices: "auto"

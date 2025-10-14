@@ -7,7 +7,7 @@ exp_name: &exp_name "vit_base_epd_nc"
 model:
   encoder:
     name: ViTEncoder
-    args: { __replace__: true, in_channels: 3, embed_dim: 64, patch_size: 8, dropout: 0.1 }
+    args: { __replace__: true, in_channels: 3, embed_dim: 64, patch_size: 16, dropout: 0.1 }
   propagator:
     name: ViTTransformer
     args:
@@ -20,7 +20,7 @@ model:
       droppath: 0.2
   decoder:
     name: ViTPatchDecoder
-    args: { __replace__: true, embed_dim: 64, patch_size: 8, dropout: 0.1 }
+    args: { __replace__: true, embed_dim: 64, patch_size: 16, dropout: 0.1 }
   head: { name: PixelHead, args: { out_channels: 1 } }
 
   loss:       { name: mse }
@@ -29,8 +29,8 @@ model:
   reg_weights: { encoder: 0.0, propagator: 0.0, decoder: 0.0, head: 0.0 }
 
 data:
-  from_run_dir: "prep_out/nc_sparse"
-  batch_size: 12
+  snapshot_dir: "prep_out/nc_full"
+  batch_size: 32
   num_workers: 8
   pin_memory: true
   persistent_workers: true
@@ -40,16 +40,16 @@ data:
 
 trainer:
   max_epochs: null
-  max_steps: 6000
+  max_steps: 1200
   precision: "16-mixed"
   accelerator: "auto"
   devices: "auto"
   strategy: "auto"
   log_every_n_steps: 10
-  val_check_interval: 0.25
+  val_check_interval: 1.0
   gradient_clip_val: 0.0
   accumulate_grad_batches: 1
-  deterministic: true
+  deterministic: false
   benchmark: false
   num_sanity_val_steps: 2
   enable_checkpointing: true
