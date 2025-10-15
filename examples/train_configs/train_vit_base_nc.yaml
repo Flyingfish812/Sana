@@ -7,7 +7,7 @@ exp_name: &exp_name "vit_base_epd_nc"
 model:
   encoder:
     name: ViTEncoder
-    args: { __replace__: true, in_channels: 3, embed_dim: 64, patch_size: 16, dropout: 0.1 }
+    args: { __replace__: true, in_channels: 3, embed_dim: 64, patch_size: 40, dropout: 0.1 }
   propagator:
     name: ViTTransformer
     args:
@@ -15,16 +15,16 @@ model:
       depth: 10
       num_heads: 8
       mlp_ratio: 4.0
-      dropout: 0.1
-      attention_dropout: 0.15
-      droppath: 0.2
+      dropout: 0.05
+      attention_dropout: 0.05
+      droppath: 0.05
   decoder:
     name: ViTPatchDecoder
-    args: { __replace__: true, embed_dim: 64, patch_size: 16, dropout: 0.1 }
+    args: { __replace__: true, embed_dim: 64, patch_size: 40, dropout: 0.1 }
   head: { name: PixelHead, args: { out_channels: 1 } }
 
   loss:       { name: mse }
-  optimizer:  { name: adamw, args: { lr: 2.0e-4, weight_decay: 5.0e-2, betas: [0.9, 0.95] } }
+  optimizer:  { name: adamw, args: { lr: 2.0e-3, weight_decay: 5.0e-2, betas: [0.9, 0.95] } }
   scheduler:  { name: ReduceLROnPlateau, monitor: "val_total", args: { factor: 0.5, patience: 3 } }
   reg_weights: { encoder: 0.0, propagator: 0.0, decoder: 0.0, head: 0.0 }
 
@@ -40,7 +40,7 @@ data:
 
 trainer:
   max_epochs: null
-  max_steps: 5000
+  max_steps: 8000
   precision: "16-mixed"
   accelerator: "auto"
   devices: "auto"

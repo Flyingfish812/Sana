@@ -60,7 +60,7 @@ def build_callbacks(cb_cfg: Dict[str, Any], root_cfg: Dict, run_dir: Path) -> Li
             mode=es.get("mode", "min"),
             patience=es.get("patience", 10),
             min_delta=es.get("min_delta", 0.0),
-            verbose=True,
+            verbose=False,
         ))
 
     ck = cb_cfg.get("checkpoint", {})

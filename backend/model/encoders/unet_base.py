@@ -56,12 +56,37 @@ class _UNetEncoder(BaseEncoder):
         if self.stem is None:
             self._lazy_build(self.in_channels or C)
 
+        # -- 新增：确保懒构建子模块迁移到输入设备 --
+        dev = x5.device
+        if next(self.stem.parameters()).device != dev:
+            self.stem = self.stem.to(dev)
+        # ModuleList 不能整体 .to()，逐个迁移
+        for i, m in enumerate(self.downs):
+            if next(m.parameters()).device != dev:
+                self.downs[i] = m.to(dev)
+
+        # -- 新增：统一精度转换的辅助函数（关闭autocast，按权重dtype计算后再转回输入dtype） --
+        def _run_block(mod: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+            in_dtype = x.dtype
+            # 找一个代表性的参数拿到权重dtype
+            try:
+                w_dtype = next(p for p in mod.parameters()).dtype
+            except StopIteration:
+                w_dtype = x.dtype  # 以防极端情况
+            if torch.is_autocast_enabled():
+                with torch.amp.autocast('cuda', enabled=False):
+                    y = mod(x.to(dtype=w_dtype))
+            else:
+                y = mod(x.to(dtype=w_dtype))
+            return y.to(in_dtype)
+
         skips = []
-        x = self.stem(x5)      # -> C0
+        x = _run_block(self.stem, x5)      # -> C0
         skips.append(x)
         for down in self.downs:
-            x = down(x)        # H,W 均下采样
+            x = _run_block(down, x)        # H,W 下采样
             skips.append(x)
 
-        self.skips = skips  # [stem, d1, d2, ...]
+        self.skips = skips  # [stem, d1, d2, ...]（保持与输入相同的dtype）
         return x
+

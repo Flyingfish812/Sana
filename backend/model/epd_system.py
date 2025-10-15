@@ -90,10 +90,10 @@ class EPDSystem(pl.LightningModule):
 
         total = main_loss + reg_loss
 
-        self.log(f"{stage}_loss", main_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log(f"{stage}_loss", main_loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         if reg_loss != 0:
-            self.log(f"{stage}_reg", reg_loss, on_step=True, on_epoch=True, prog_bar=False)
-        self.log(f"{stage}_total", total, on_step=True, on_epoch=True, prog_bar=True)
+            self.log(f"{stage}_reg", reg_loss, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log(f"{stage}_total", total, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
 
         return total
 

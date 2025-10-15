@@ -67,14 +67,37 @@ class UpBlock(nn.Module):
         self.conv = conv_block(in_c + skip_c, out_c)
 
     def forward(self, x, skip):
+        # 先上采样（无权重运算，不涉及 dtype 冲突）
         x = self.up(x)
-        # 对齐空间尺寸（因 rounding 可能差 1）
+
+        # 对齐空间尺寸
         dh = skip.shape[-2] - x.shape[-2]
         dw = skip.shape[-1] - x.shape[-1]
         if dh != 0 or dw != 0:
-            x = nn.functional.pad(x, (0, dw, 0, dh))
+            x = torch.nn.functional.pad(x, (0, dw, 0, dh))
+
+        # -- 新增：拼接前保证二者 dtype 一致，避免 cat 报错 --
+        if skip.dtype != x.dtype:
+            skip = skip.to(dtype=x.dtype)
         x = torch.cat([x, skip], dim=1)
-        x = self.conv(x)
+
+        # -- 新增：确保卷积子模块在正确设备 --
+        if next(self.conv.parameters()).device != x.device:
+            self.conv = self.conv.to(x.device)
+
+        # -- 新增：按权重 dtype 计算，再还原为输入 dtype（关闭autocast以避免半精度/单精度混算冲突） --
+        in_dtype = x.dtype
+        try:
+            w_dtype = next(self.conv.parameters()).dtype
+        except StopIteration:
+            w_dtype = x.dtype
+
+        if torch.is_autocast_enabled():
+            with torch.amp.autocast('cuda', enabled=False):
+                x = self.conv(x.to(dtype=w_dtype))
+        else:
+            x = self.conv(x.to(dtype=w_dtype))
+        x = x.to(in_dtype)
         return x
 
 @register("decoder", "UNetBase")
@@ -107,9 +130,18 @@ class _UNetDecoder(BaseDecoder):
         assert isinstance(skips, (list, tuple)) and len(skips) >= 1, "UNetDecoder requires encoder.skips (list)."
         if len(self.ups) == 0:
             self._lazy_build(skips)
+
+        # -- 新增：确保懒构建的 UpBlock 都在输入设备 --
+        dev = x5.device
+        for i, up in enumerate(self.ups):
+            # UpBlock 有 conv 权重，检查并迁移
+            if next(up.parameters()).device != dev:
+                self.ups[i] = up.to(dev)
+
         x = x5
         # 倒序使用 skip：最后一层与倒数第二层 skip 拼接……
         for i, up in enumerate(self.ups):
             skip = skips[-(i+2)]  # 对应 d_{end-i-1}
+            # 若 skip 与 x 在 dtype 不一致，这里不转，由 UpBlock 内部统一
             x = up(x, skip)
-        return x  # 输出特征通道为 base_channels
+        return x  # 输出特征通道为 base_channels（保留 x 的 dtype）

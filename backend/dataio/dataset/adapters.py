@@ -2,7 +2,7 @@
 from __future__ import annotations
 import numpy as np
 import math
-from typing import Dict, Any, Optional, Sequence
+from typing import Dict, Any, Optional, Sequence, Union
 from ..schema import ArraySample, AdapterOutput
 from ..registry import register_adapter
 
@@ -124,7 +124,7 @@ def _interp_1nn(H: int, W: int,
 @register_adapter("sparse2d")
 def Sparse2DAdapter(
     sample: ArraySample, *,
-    mode: str = "random",                 # "random" | "mask"
+    mode: str = "random",
     num_points: int = 1024,
     seed: int = 42,
     mask_path: Optional[str] = None,
@@ -132,15 +132,13 @@ def Sparse2DAdapter(
     include_mask_in_cond: bool = True,
     include_points_in_cond: bool = True,
     avoid_nan: bool = True,
-    reuse_points: str = "per_dataset",    # "none" | "per_dataset" | "per_mask"
+    reuse_points: str = "per_dataset",
     seed_per_time: bool = False,
-    # —— 新增参数（用于通道选择/兼容 NC 的多通道）——
-    # 基准通道：用于构造 recon / masked 的“基底”通道；可为 int 索引或通道名（如 "omega"）
+    # —— 现有参数 —— 
     base_channel: Optional[object] = None,
-    # 监督目标通道选择：None=保留所有（旧行为）；可为索引或通道名列表（如 ["omega"]）
     target_channels: Optional[Sequence[object]] = None,
-    # 追加到输入 x 的额外原始通道（例如把 ["u","v"] 也拼入输入）
     extra_input_channels: Optional[Sequence[object]] = None,
+    extra_input_mode: Union[str, Sequence[str]] = "raw",  # "raw" | "1nn" | "masked" | "both"
 ) -> AdapterOutput:
     """
     稀疏采样 + 1-NN 插值（带可配置通道选择）：
@@ -241,26 +239,55 @@ def Sparse2DAdapter(
     x_est = vals[idx_map]                                      # [H,W,C]
 
     # ---------- 5) 组装 x（三件套 + 额外通道） ----------
-    # 三件套基于 base_idx：recon(base)、mask、masked(base)
     recon  = x_est[..., base_idx].astype(np.float32)           # [H,W]
     mask_img = np.zeros((H, W), dtype=np.float32)
     mask_img[pts[:, 0], pts[:, 1]] = 1.0
+
     if nan_mask_from_meta is not None:
-        mark_map = (-1.0) * (nan_mask_from_meta > 0.5).astype(np.float32)  # 先把 NaN 置为 -1
+        mark_map = (-1.0) * (nan_mask_from_meta > 0.5).astype(np.float32)
     else:
         mark_map = np.zeros((H, W), dtype=np.float32)
-        # 如果没有 nan_mask，则不写 -1；保持 0/1 行为
-
-    # 采样点位置覆盖为 +1（优先级高于 NaN 标记）
     mark_map[pts[:, 0], pts[:, 1]] = 1.0
 
-    # masked 基于 base 通道原值 * 采样点（保持兼容）
     masked = target[..., base_idx].astype(np.float32) * mask_img
 
-    # 将第二通道改为 mark_map（满足 -1/1/0 需求）
     x_list = [recon[None, ...], mark_map[None, ...], masked[None, ...]]  # [3,H,W]
+
+    # 处理额外通道模式
     if extra_inds:
-        x_list.append(np.transpose(target[..., extra_inds], (2, 0, 1)).astype(np.float32))
+        # 规范化 extra_input_mode 为列表（每个额外通道一个模式）
+        if isinstance(extra_input_mode, str):
+            extra_modes = [extra_input_mode] * len(extra_inds)
+        else:
+            if len(extra_input_mode) != len(extra_inds):
+                raise ValueError(
+                    f"extra_input_mode length ({len(extra_input_mode)}) must match "
+                    f"extra_input_channels length ({len(extra_inds)})"
+                )
+            extra_modes = list(extra_input_mode)
+
+        # 预备需要的张量视图
+        # 原值：target[..., extra_inds] -> [H,W,E]
+        extras_raw = target[..., extra_inds].astype(np.float32)                    # [H,W,E]
+        # 1NN：x_est[..., extra_inds] -> [H,W,E]
+        extras_1nn = x_est[..., extra_inds].astype(np.float32)                     # [H,W,E]
+        # masked：extras_raw * mask_img
+        extras_masked = (extras_raw * mask_img[..., None].astype(np.float32))      # [H,W,E]
+
+        for j, mode_j in enumerate(extra_modes):
+            if mode_j not in ("raw", "1nn", "masked", "both"):
+                raise ValueError(f"unknown extra_input_mode '{mode_j}' "
+                                 f"(allowed: 'raw'|'1nn'|'masked'|'both')")
+            if mode_j == "raw":
+                x_list.append(extras_raw[..., j][None, ...])       # [1,H,W]
+            elif mode_j == "1nn":
+                x_list.append(extras_1nn[..., j][None, ...])
+            elif mode_j == "masked":
+                x_list.append(extras_masked[..., j][None, ...])
+            elif mode_j == "both":
+                x_list.append(extras_1nn[..., j][None, ...])
+                x_list.append(extras_masked[..., j][None, ...])
+
     x = np.concatenate(x_list, axis=0)
 
     # ---------- 6) 组装 y（可裁通道；默认旧行为=保留全部） ----------

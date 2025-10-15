@@ -4,9 +4,9 @@ reader:
   var_keys: ["u", "v"]             # 自定义所需变量；只有一个变量时可写单值列表
   u_key: u                         # 若计算涡量需提供 u_key/v_key
   v_key: v
-  want_omega: true                 # 追加涡量通道 (omega)
-  dx: 1.0                          # 计算涡量的网格间距（按需调整）
-  dy: 1.0
+  want_omega: false                 # 追加涡量通道 (omega)
+  dx: 0.1                          # 计算涡量的网格间距（按需调整）
+  dy: 0.1
   time_key: tdim                 # 如坐标命名特殊可覆盖
   y_key: ydim
   x_key: xdim
@@ -31,8 +31,10 @@ adapter:
   nn_block_size: 8192
   include_mask_in_cond: true
   include_points_in_cond: true
-  base_channel: omega
-  target_channels: ["omega"]
+  base_channel: u
+  target_channels: ["u"]
+  # extra_input_channels: ["v"]
+  # extra_input_mode: 1nn
   # 若使用外部点击掩码：
   # mode: mask
   # mask_path: ./click_masks/nc_clicks.json
@@ -44,7 +46,7 @@ split:
   ratios: { train: 0.8, val: 0.1, test: 0.1 }
   seed: 123
 
-batch_size: 12
+batch_size: 32
 num_workers: 8
 shuffle: true
 pin_memory: true
