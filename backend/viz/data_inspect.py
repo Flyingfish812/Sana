@@ -4,6 +4,7 @@ from typing import Optional, Dict, Any, Union, Sequence, Tuple
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
 from backend.dataio.schema import ArraySample, AdapterOutput
 from backend.dataio.dataset.unified import UnifiedDataset
 
@@ -279,13 +280,41 @@ def _plot_triplet(x_img: np.ndarray,
     2) output 单通道
     3) output + 采样点（红色）
     """
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-    axes[0].imshow(x_img); axes[0].set_title(f"input [{ch_name}]")
-    axes[1].imshow(y_img); axes[1].set_title(f"output [{ch_name}]")
-    axes[2].imshow(y_img); axes[2].set_title("output + samples")
+    fig = plt.figure(figsize=(14, 5), constrained_layout=False)
+    gs  = fig.add_gridspec(nrows=2, ncols=3,
+                           height_ratios=[20, 1],  # 第二行给色条
+                           hspace=0.04, wspace=0.06)
+
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax1 = fig.add_subplot(gs[0, 1])
+    ax2 = fig.add_subplot(gs[0, 2])
+    cax = fig.add_subplot(gs[1, :])
+
+    # 颜色设定：红-白-蓝，0 居中
+    y_flat = y_img[np.isfinite(y_img)]
+    if y_flat.size == 0:
+        vmin, vmax = -1.0, 1.0
+    else:
+        vmin = float(np.quantile(y_flat, 0.01))
+        vmax = float(np.quantile(y_flat, 0.99))
+        if vmin == vmax: vmax = vmin + 1.0
+    norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+    cmap = "RdBu_r"
+
+    im0 = ax0.imshow(x_img, cmap=cmap, norm=norm); ax0.set_title(f"input [{ch_name}]")
+    im1 = ax1.imshow(y_img, cmap=cmap, norm=norm); ax1.set_title(f"output [{ch_name}]")
+    im2 = ax2.imshow(y_img, cmap=cmap, norm=norm); ax2.set_title("output + samples")
+    for ax in (ax0, ax1, ax2): ax.axis("off")
+
     if pts is not None and pts.size > 0:
-        axes[2].scatter(pts[:, 1], pts[:, 0], s=6, c="red", marker="o")  # 红色点
-    fig.suptitle(title)
+        ax2.scatter(pts[:, 1], pts[:, 0], s=6, c="red", marker="o")
+
+    # 关键：把 colorbar 画在专用的 cax 上，而不是 ax=axes
+    cbar = fig.colorbar(im1, cax=cax, orientation="horizontal")
+    cbar.set_label("Intensity", fontsize=10)
+
+    fig.suptitle(title, y=0.98)
+    # 不再调用 fig.tight_layout()；如果想稍微收紧，上面用 gridspec 的 hspace/wspace 控
     plt.show()
 
 def check_dataloader(dl, n_batches: int = 2, channel: Optional[Union[int,str]] = None):

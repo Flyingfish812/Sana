@@ -6,6 +6,7 @@ from .coords import AddCoordsTransform
 from .time_encoding import AddTimeEncodingTransform
 from .to_tensor import ToTensorTransform
 from .fillna import FillNaNTransform
+from .nanmask import CaptureNaNMaskTransform
 
 __all__ = [
     "Transform",
@@ -17,4 +18,5 @@ __all__ = [
     "AddTimeEncodingTransform",
     "ToTensorTransform",
     "FillNaNTransform",
+    "CaptureNaNMaskTransform",
 ]

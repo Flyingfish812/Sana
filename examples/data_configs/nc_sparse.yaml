@@ -19,6 +19,7 @@ sampler:
 
 transforms:
   # 大多数 NC 数据不会大量 NaN；若存在，建议开启：
+  capture_nan_mask: { target_only: true }
   # fillna: { method: mean }
   normalize: { method: zscore }
 

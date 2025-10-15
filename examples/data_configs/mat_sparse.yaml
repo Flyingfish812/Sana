@@ -13,7 +13,8 @@ sampler:
 
 transforms:
   # 先对 NaN 做处理，避免影响后续归一化/插值
-  fillna: { method: value, value: -273.15 }        # 或 { method: value, value: -273.15 }
+  capture_nan_mask: { target_only: true }
+  fillna: { method: mean }        # 或 { method: value, value: -273.15 }
   normalize: { method: zscore }
 
 adapter:

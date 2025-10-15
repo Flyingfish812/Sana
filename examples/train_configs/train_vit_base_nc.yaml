@@ -40,7 +40,7 @@ data:
 
 trainer:
   max_epochs: null
-  max_steps: 1200
+  max_steps: 5000
   precision: "16-mixed"
   accelerator: "auto"
   devices: "auto"

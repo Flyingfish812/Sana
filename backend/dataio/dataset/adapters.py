@@ -182,7 +182,20 @@ def Sparse2DAdapter(
     extra_inds = _indices_from_spec(extra_input_channels)      # e.g. ["u","v"] -> [0,1]
 
     # ---------- 1) 可采样区域 ----------
-    finite = _finite_mask(target) if avoid_nan else np.ones((H, W), dtype=bool)
+    nan_mask_from_meta = None
+    if (meta.attrs is not None) and ("nan_mask" in meta.attrs):
+        nan_mask_from_meta = np.asarray(meta.attrs["nan_mask"]).astype(np.float32)  # [H,W], 1=NaN
+        if nan_mask_from_meta.shape != (H, W):
+            raise ValueError(f"nan_mask shape mismatch, expect {(H,W)}, got {nan_mask_from_meta.shape}")
+
+    if avoid_nan:
+        if nan_mask_from_meta is not None:
+            finite = (nan_mask_from_meta < 0.5)  # True = 可采样
+        else:
+            # 兼容旧行为：没有预捕获时，退化为基于目标帧的有限性判断
+            finite = _finite_mask(target)
+    else:
+        finite = np.ones((H, W), dtype=bool)
 
     # ---------- 2) 采样点 ----------
     if mode == "random":
@@ -232,14 +245,23 @@ def Sparse2DAdapter(
     recon  = x_est[..., base_idx].astype(np.float32)           # [H,W]
     mask_img = np.zeros((H, W), dtype=np.float32)
     mask_img[pts[:, 0], pts[:, 1]] = 1.0
+    if nan_mask_from_meta is not None:
+        mark_map = (-1.0) * (nan_mask_from_meta > 0.5).astype(np.float32)  # 先把 NaN 置为 -1
+    else:
+        mark_map = np.zeros((H, W), dtype=np.float32)
+        # 如果没有 nan_mask，则不写 -1；保持 0/1 行为
+
+    # 采样点位置覆盖为 +1（优先级高于 NaN 标记）
+    mark_map[pts[:, 0], pts[:, 1]] = 1.0
+
+    # masked 基于 base 通道原值 * 采样点（保持兼容）
     masked = target[..., base_idx].astype(np.float32) * mask_img
 
-    x_list = [recon[None, ...], mask_img[None, ...], masked[None, ...]]  # [3,H,W]
+    # 将第二通道改为 mark_map（满足 -1/1/0 需求）
+    x_list = [recon[None, ...], mark_map[None, ...], masked[None, ...]]  # [3,H,W]
     if extra_inds:
-        # 把目标帧的原始若干通道（如 u,v）拼到输入
-        # 注意：这里直接用目标帧的原值（不是重建值），以提供更强的条件信息
-        x_list.append(np.transpose(target[..., extra_inds], (2, 0, 1)).astype(np.float32))  # [n_extra,H,W]
-    x = np.concatenate(x_list, axis=0)  # [3(+n_extra), H, W]
+        x_list.append(np.transpose(target[..., extra_inds], (2, 0, 1)).astype(np.float32))
+    x = np.concatenate(x_list, axis=0)
 
     # ---------- 6) 组装 y（可裁通道；默认旧行为=保留全部） ----------
     if tgt_inds:

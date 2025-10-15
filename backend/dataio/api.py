@@ -12,7 +12,8 @@ from .transforms import (
     AddCoordsTransform,
     AddTimeEncodingTransform,
     ToTensorTransform,
-    FillNaNTransform
+    FillNaNTransform,
+    CaptureNaNMaskTransform,
 )
 from .dataset.unified import UnifiedDataset
 from .dataset.collate import make_collate
@@ -38,6 +39,13 @@ def _build_transforms(cfg: Dict[str, Any]) -> Compose:
     顺序：Normalize -> AddCoords -> AddTimeEncoding -> ToTensor
     """
     ts = []
+    cap_cfg = cfg.get("capture_nan_mask")
+    if cap_cfg:
+        ts.append(CaptureNaNMaskTransform(
+            target_only=bool(cap_cfg.get("target_only", True)),
+            reduce_channel=str(cap_cfg.get("reduce_channel", "any"))
+        ))
+        
     fill_cfg = cfg.get("fillna")
     if fill_cfg:
         method = fill_cfg.get("method", "value")
