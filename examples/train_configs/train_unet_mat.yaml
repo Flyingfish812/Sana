@@ -3,11 +3,11 @@
 # 适配我们当前的 EPD 模型与 train/ 侧代码
 # ==========================================================
 
-exp_name: &exp_name "unet_baseline_epd"
+exp_name: &exp_name "unet_baseline_epd_mat"
 
 # --------- 模型装配（EPDSystem：Encoder→Propagator→Decoder→Head）---------
 model:
-  encoder:    { name: UNetBase, args: { base_channels: 32, depth: 4 } }
+  encoder:    { name: UNetBase, args: { in_channels: 3, base_channels: 32, depth: 4 } }
   propagator: { name: Identity, args: {} }
   decoder:    { name: UNetBase, args: { base_channels: 32 } }
   head:       { name: PixelHead, args: { out_channels: 1 } }
@@ -19,7 +19,7 @@ model:
 
 # --------- 数据 ---------
 data:
-  from_run_dir: "prep_out/h5_sparse"  # ← 指向“上一存档点”的 run 目录
+  snapshot_dir: "prep_out/mat_sparse"  # ← 指向“上一存档点”的 run 目录
   batch_size: 16
   num_workers: 8
   pin_memory: true
@@ -41,13 +41,13 @@ data:
 # --------- Trainer 配置（Lightning）---------
 trainer:
   max_epochs: null
-  max_steps: 10000
+  max_steps: 6000
   precision: "16-mixed"           # 可选: "32" | "bf16-mixed"
   accelerator: "auto"
   devices: "auto"
   strategy: "auto"
   log_every_n_steps: 10
-  val_check_interval: 0.25
+  val_check_interval: 1.0
   gradient_clip_val: 0.0
   accumulate_grad_batches: 1
   deterministic: true

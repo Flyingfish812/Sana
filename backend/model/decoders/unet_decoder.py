@@ -1,147 +1,93 @@
-# backend/model/decoders/unet_decoder.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Tuple, Union
-from ..base_components.decoder_base import BaseDecoder
+from typing import List, Tuple
 from ..factory import register
-from ..utils.norm import ChannelLayerNorm
+from ..base_components.decoder_base import BaseDecoder
 
-_Number = Union[int, float]
-_SF = Union[_Number, Tuple[_Number, _Number], Tuple[_Number, _Number, _Number]]
-
-class UpsampleAwareTime(nn.Module):
-    """
-    T=1 的 5D 输入: 退回逐帧 2D bilinear（确定性）；
-    T>1 的 5D 输入: 用 3D 'nearest'（确定性，避免 trilinear）；
-    4D 输入: 标准 2D bilinear。
-    """
-    def __init__(self, scale_factor: _SF = 2, mode2d: str = "bilinear",
-                 mode3d: str = "nearest", align_corners: bool = False):
-        super().__init__()
-        self.scale_factor = scale_factor
-        self.mode2d = mode2d
-        self.mode3d = mode3d
-        self.align_corners = align_corners
-
-    def _sf2d(self):
-        sf = self.scale_factor
-        if isinstance(sf, (tuple, list)) and len(sf) == 3:
-            # (T,H,W) -> (H,W)
-            return (sf[1], sf[2])
-        return sf
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim == 5:
-            # [B,C,T,H,W]
-            if x.shape[2] == 1:
-                x2d = x.squeeze(2)  # -> [B,C,H,W]
-                out2d = F.interpolate(x2d, scale_factor=self._sf2d(),
-                                      mode=self.mode2d, align_corners=self.align_corners)
-                return out2d.unsqueeze(2)  # -> [B,C,1,H,W]
-            # T>1：用确定性的 3D nearest
-            return F.interpolate(x, scale_factor=self.scale_factor,
-                                 mode=self.mode3d, align_corners=self.align_corners)
-        elif x.ndim == 4:
-            # [B,C,H,W]
-            return F.interpolate(x, scale_factor=self._sf2d(),
-                                 mode=self.mode2d, align_corners=self.align_corners)
-        raise ValueError(f"UpsampleAwareTime: unsupported ndim={x.ndim}")
-
-
-def conv_block(in_c, out_c, k=3, s=1, p=1):
+# ======= 基本组件 =======
+def _conv_block_2d(in_c: int, out_c: int) -> nn.Sequential:
     return nn.Sequential(
-        nn.Conv3d(in_c, out_c, kernel_size=(1,k,k), stride=(1,s,s), padding=(0,p,p), bias=False),
-        ChannelLayerNorm(out_c),
+        nn.Conv2d(in_c, out_c, kernel_size=3, padding=1, bias=False),
+        nn.BatchNorm2d(out_c, eps=1e-5, momentum=0.1),
         nn.ReLU(inplace=True),
-        nn.Conv3d(out_c, out_c, kernel_size=(1,k,k), stride=(1,1,1), padding=(0,p,p), bias=False),
-        ChannelLayerNorm(out_c),
+        nn.Conv2d(out_c, out_c, kernel_size=3, padding=1, bias=False),
+        nn.BatchNorm2d(out_c, eps=1e-5, momentum=0.1),
         nn.ReLU(inplace=True),
     )
 
-class UpBlock(nn.Module):
-    def __init__(self, in_c, skip_c, out_c):
+class _UpBlock2d(nn.Module):
+    def __init__(self, in_c: int, skip_c: int, out_c: int):
         super().__init__()
-        self.up = UpsampleAwareTime(scale_factor=(1,2,2), mode2d="bilinear", mode3d="nearest", align_corners=False)
-        self.conv = conv_block(in_c + skip_c, out_c)
+        self.align = nn.Conv2d(in_c, in_c, kernel_size=1, bias=False)
+        self.fuse = _conv_block_2d(in_c + skip_c, out_c)
 
-    def forward(self, x, skip):
-        # 先上采样（无权重运算，不涉及 dtype 冲突）
-        x = self.up(x)
+    def forward(self, x4: torch.Tensor, skip4: torch.Tensor) -> torch.Tensor:
+        ref_dtype = next(self.fuse.parameters()).dtype
+        if x4.dtype != ref_dtype:
+            x4 = x4.to(ref_dtype)
+        if skip4.dtype != ref_dtype:
+            skip4 = skip4.to(ref_dtype)
 
-        # 对齐空间尺寸
-        dh = skip.shape[-2] - x.shape[-2]
-        dw = skip.shape[-1] - x.shape[-1]
-        if dh != 0 or dw != 0:
-            x = torch.nn.functional.pad(x, (0, dw, 0, dh))
+        x4 = F.interpolate(x4, size=(skip4.shape[-2], skip4.shape[-1]),
+                       mode="nearest")
+        x4 = self.align(x4)
+        x4 = torch.cat([x4, skip4], dim=1)
+        return self.fuse(x4)
 
-        # -- 新增：拼接前保证二者 dtype 一致，避免 cat 报错 --
-        if skip.dtype != x.dtype:
-            skip = skip.to(dtype=x.dtype)
-        x = torch.cat([x, skip], dim=1)
+def _to_4d(x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    if x.ndim == 5:
+        b, c, t, h, w = x.shape
+        return x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w), (b, t)
+    elif x.ndim == 4:
+        return x, (x.shape[0], 1)
+    else:
+        raise ValueError(f"Unexpected shape {x.shape}")
 
-        # -- 新增：确保卷积子模块在正确设备 --
-        if next(self.conv.parameters()).device != x.device:
-            self.conv = self.conv.to(x.device)
 
-        # -- 新增：按权重 dtype 计算，再还原为输入 dtype（关闭autocast以避免半精度/单精度混算冲突） --
-        in_dtype = x.dtype
-        try:
-            w_dtype = next(self.conv.parameters()).dtype
-        except StopIteration:
-            w_dtype = x.dtype
+def _to_5d(y: torch.Tensor, bt: Tuple[int, int]) -> torch.Tensor:
+    b, t = bt
+    if t == 1:
+        return y.reshape(b, -1, 1, y.shape[-2], y.shape[-1])
+    return y.reshape(b, t, y.shape[1], y.shape[-2], y.shape[-1]).permute(0, 2, 1, 3, 4)
 
-        if torch.is_autocast_enabled():
-            with torch.amp.autocast('cuda', enabled=False):
-                x = self.conv(x.to(dtype=w_dtype))
-        else:
-            x = self.conv(x.to(dtype=w_dtype))
-        x = x.to(in_dtype)
-        return x
 
+# ======= 主体结构 =======
 @register("decoder", "UNetBase")
-def UNetDecoder(base_channels: int = 32, out_channels: int | None = None):
-    return _UNetDecoder(base_channels=base_channels, out_channels=out_channels)
-
-class _UNetDecoder(BaseDecoder):
+class UNetDecoder(BaseDecoder):
     """
-    与上面的 UNetEncoder 对偶：多级 up + concat skip。
-    需要 encoder.skips: [stem, d1, d2, ..., d{depth-1}]
+    UNet Decoder (Conv2d)
+    - 无懒构建，参数初始化于 __init__
+    - 自动 dtype 对齐
     """
-    def __init__(self, base_channels: int = 32, out_channels: int | None = None):
+    def __init__(self, base_channels: int = 32, depth: int = 4):
         super().__init__()
         self.base_channels = base_channels
-        self.out_channels = out_channels
+        self.depth = depth
 
+        chans = [base_channels * (2 ** i) for i in range(depth)]
         self.ups = nn.ModuleList()
-        self.proj = None  # 输出投影在 Head 里做，这里输出高通道特征
-
-    def _lazy_build(self, skips: List[torch.Tensor]):
-        depth = len(skips)
-        chs = [self.base_channels * (2**i) for i in range(depth)]
-        # bottleneck 通道数 = 最深层通道
-        in_c = chs[-1]
+        in_c = chans[-1]
         for i in range(depth - 2, -1, -1):
-            self.ups.append(UpBlock(in_c, chs[i], chs[i]))
-            in_c = chs[i]
+            self.ups.append(_UpBlock2d(in_c, chans[i], chans[i]))
+            in_c = chans[i]
+        self.out_channels = chans[0]
 
-    def forward(self, x5: torch.Tensor, skips=None) -> torch.Tensor:
-        assert isinstance(skips, (list, tuple)) and len(skips) >= 1, "UNetDecoder requires encoder.skips (list)."
-        if len(self.ups) == 0:
-            self._lazy_build(skips)
+    def forward(self, x: torch.Tensor, skips: List[torch.Tensor]) -> torch.Tensor:
+        ref_dtype = next(self.parameters()).dtype
+        if x.dtype != ref_dtype:
+            x = x.to(ref_dtype)
+        skips = [s.to(ref_dtype) if s.dtype != ref_dtype else s for s in skips]
 
-        # -- 新增：确保懒构建的 UpBlock 都在输入设备 --
-        dev = x5.device
+        x4, bt = _to_4d(x)
+        skips4 = [_to_4d(s)[0] for s in skips]
+
+        h = x4
         for i, up in enumerate(self.ups):
-            # UpBlock 有 conv 权重，检查并迁移
-            if next(up.parameters()).device != dev:
-                self.ups[i] = up.to(dev)
+            s4 = skips4[-(i + 2)]
+            h = up(h, s4)
 
-        x = x5
-        # 倒序使用 skip：最后一层与倒数第二层 skip 拼接……
-        for i, up in enumerate(self.ups):
-            skip = skips[-(i+2)]  # 对应 d_{end-i-1}
-            # 若 skip 与 x 在 dtype 不一致，这里不转，由 UpBlock 内部统一
-            x = up(x, skip)
-        return x  # 输出特征通道为 base_channels（保留 x 的 dtype）
+        y = _to_5d(h, bt)
+        return y

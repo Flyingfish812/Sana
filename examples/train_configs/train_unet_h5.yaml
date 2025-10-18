@@ -3,7 +3,7 @@
 # 适配我们当前的 EPD 模型与 train/ 侧代码
 # ==========================================================
 
-exp_name: &exp_name "unet_baseline_epd_nc"
+exp_name: &exp_name "unet_baseline_epd_h5"
 
 # --------- 模型装配（EPDSystem：Encoder→Propagator→Decoder→Head）---------
 model:
@@ -19,8 +19,8 @@ model:
 
 # --------- 数据 ---------
 data:
-  snapshot_dir: "prep_out/nc_full"  # ← 指向“上一存档点”的 run 目录
-  batch_size: 32
+  snapshot_dir: "prep_out/h5_sparse"  # ← 指向“上一存档点”的 run 目录
+  batch_size: 16
   num_workers: 8
   pin_memory: true
   persistent_workers: true
@@ -28,11 +28,21 @@ data:
   drop_last: false
   save_dataloaders: true  # 开启后，这一轮也会把 dataloaders 存到自己的 run 目录
 
+# data:
+#   builder: "backend.dataio.api:build_all"
+#   builder_args:
+#     snapshot_dir: "data_snapshots/unified"
+#   batch_size: 8
+#   num_workers: 4
+#   pin_memory: true
+#   persistent_workers: true
+#   save_dataloaders: true      # ← 本轮保存，下一轮就可用 from_run_dir 直接复用
+
 # --------- Trainer 配置（Lightning）---------
 trainer:
   max_epochs: null
-  max_steps: 5000
-  precision: "bf16-mixed"           # 可选: "32" | "bf16-mixed"
+  max_steps: 6000
+  precision: "16-mixed"           # 可选: "32" | "bf16-mixed"
   accelerator: "auto"
   devices: "auto"
   strategy: "auto"
@@ -40,11 +50,11 @@ trainer:
   val_check_interval: 1.0
   gradient_clip_val: 0.0
   accumulate_grad_batches: 1
-  deterministic: false
+  deterministic: true
   benchmark: false
   num_sanity_val_steps: 2
   enable_checkpointing: true
-  enable_model_summary: false
+  enable_model_summary: true
 
 # --------- 日志系统 ---------
 logging:
