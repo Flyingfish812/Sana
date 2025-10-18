@@ -10,7 +10,7 @@ model:
   encoder:    { name: UNetBase, args: { base_channels: 32, depth: 4 } }
   propagator: { name: Identity, args: {} }
   decoder:    { name: UNetBase, args: { base_channels: 32 } }
-  head:       { name: PixelHead, args: { out_channels: 2 } }
+  head:       { name: PixelHead, args: { out_channels: 1 } }
 
   loss:       { name: l1 }
   optimizer:  { name: adamw, args: { lr: 1.0e-3, weight_decay: 1.0e-4 } }
@@ -31,7 +31,7 @@ data:
 # --------- Trainer 配置（Lightning）---------
 trainer:
   max_epochs: null
-  max_steps: 10000
+  max_steps: 5000
   precision: "bf16-mixed"           # 可选: "32" | "bf16-mixed"
   accelerator: "auto"
   devices: "auto"

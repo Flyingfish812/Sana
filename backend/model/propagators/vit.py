@@ -116,11 +116,14 @@ class ViTPropagator(BasePropagator):
         attention_dropout: float = 0.0,
         droppath: float = 0.0,
         qkv_bias: bool = True,
+        use_post_smooth: bool = True,     # ← 新增：是否在末尾做空间平滑
+        post_kernel: int = 3,             # ← 新增：空间平滑核
     ):
         super().__init__()
         if depth <= 0:
             raise ValueError("Transformer depth must be positive")
         drop_values: List[float] = torch.linspace(0.0, droppath, depth).tolist() if depth > 1 else [droppath]
+
         self.blocks = nn.ModuleList(
             [
                 ViTBlock(
@@ -137,11 +140,46 @@ class ViTPropagator(BasePropagator):
         )
         self.norm = nn.LayerNorm(embed_dim)
 
+        # ← 新增：对空间维度做轻量深度可分离 3D 卷积（时间核为1，不改变 T）
+        self.use_post_smooth = use_post_smooth
+        if use_post_smooth:
+            pad = post_kernel // 2
+            self.post_smooth = nn.Conv3d(
+                in_channels=embed_dim,
+                out_channels=embed_dim,
+                kernel_size=(1, post_kernel, post_kernel),  # 仅平滑 H,W
+                padding=(0, pad, pad),
+                groups=embed_dim,                            # 深度卷积：每通道独立
+                bias=False,
+            )
+            # 初始化为“近似均值滤波”：中心略大，其余均匀
+            with torch.no_grad():
+                w = self.post_smooth.weight
+                w.zero_()
+                center = (post_kernel // 2)
+                val = 1.0 / (post_kernel * post_kernel)
+                w[:, 0, 0, :, :] += val
+                # （可选）中心稍大一点，有助于保边，可不加：
+                # w[:, 0, 0, center, center] += 0.0
+        else:
+            self.post_smooth = None
+
     def forward(self, x5: torch.Tensor) -> torch.Tensor:
         b, c, t, h, w = x5.shape
-        tokens = x5.permute(0, 2, 3, 4, 1).reshape(b * t, h * w, c)
+        tokens = x5.permute(0, 2, 3, 4, 1).reshape(b * t, h * w, c)  # [B*T, H*W, C]
+
         for block in self.blocks:
             tokens = block(tokens)
-        tokens = self.norm(tokens)
-        tokens = tokens.reshape(b, t, h, w, c).permute(0, 4, 1, 2, 3)
-        return tokens
+        tokens = self.norm(tokens)  # [B*T, H*W, C]
+
+        # reshape 回 5D
+        x = tokens.reshape(b, t, h, w, c).permute(0, 4, 1, 2, 3)  # [B,C,T,H,W]
+
+        # 末尾“抹缝”平滑（只在空间维度上做 3×3 深度卷积）
+        if self.use_post_smooth and self.post_smooth is not None:
+            # 保证模块设备与精度一致（防止出现 CPU 权重/CUDA 输入 的不一致）
+            if self.post_smooth.weight.device != x.device:
+                self.post_smooth = self.post_smooth.to(x.device)
+            x = self.post_smooth(x)
+
+        return x

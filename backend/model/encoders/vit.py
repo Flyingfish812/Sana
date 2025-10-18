@@ -58,6 +58,7 @@ class ViTEncoder(BaseEncoder):
         patch_size: int | Tuple[int, int] = 16,
         in_channels: Optional[int] = None,
         dropout: float = 0.0,
+        use_abs_pos_embed: bool = False,   # ← 新增：默认关闭绝对位置编码
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -67,11 +68,15 @@ class ViTEncoder(BaseEncoder):
 
         self.patch_embed: Optional[PatchEmbed2D] = None
         self.pos_embed: Optional[nn.Parameter] = None
+        self.use_abs_pos_embed = use_abs_pos_embed
 
     def _lazy_build(self, in_channels: int) -> None:
         self.patch_embed = PatchEmbed2D(in_channels, self.embed_dim, self.patch_size)
 
     def _ensure_pos_embed(self, grid_hw: Tuple[int, int], device: torch.device, dtype: torch.dtype) -> None:
+        if not getattr(self, "use_abs_pos_embed", False):
+            self.pos_embed = None
+            return
         h, w = grid_hw
         expected_shape = (1, self.embed_dim, 1, h, w)
         if self.pos_embed is None or tuple(self.pos_embed.shape) != expected_shape:
@@ -86,11 +91,13 @@ class ViTEncoder(BaseEncoder):
             self._lazy_build(self.in_channels or c)
 
         x_flat = x5.reshape(b * t, c, h, w)
-        patches = self.patch_embed(x_flat)  # type: ignore[arg-type]
+        patches = self.patch_embed(x_flat)  # [B*T, C', Gh, Gw]
         _, _, gh, gw = patches.shape
-        patches = patches.view(b, t, self.embed_dim, gh, gw).permute(0, 2, 1, 3, 4)
+        patches = patches.view(b, t, self.embed_dim, gh, gw).permute(0, 2, 1, 3, 4)  # [B, C', T, Gh, Gw]
 
         self._ensure_pos_embed((gh, gw), patches.device, patches.dtype)
-        patches = patches + self.pos_embed  # type: ignore[operator]
+        if self.pos_embed is not None:           # ← 仅在开启绝对位置编码时叠加
+            patches = patches + self.pos_embed   # type: ignore[operator]
         patches = self.dropout(patches)
         return patches
+    
