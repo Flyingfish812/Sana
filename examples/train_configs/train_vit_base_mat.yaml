@@ -21,7 +21,7 @@ model:
       embed_dim: 32
       patch_size: 36
       dropout: 0.0
-  head:       { name: PixelHead, args: { out_channels: 1 } }
+  head:       { name: PixelHead, args: { in_channels: 32, out_channels: 1 } }
 
   loss:       { name: mse }
   optimizer:  { name: adamw, args: { lr: 3.0e-4, weight_decay: 1.0e-4 } }
@@ -40,7 +40,7 @@ data:
 
 trainer:
   max_epochs: null
-  max_steps: 1200
+  max_steps: 5000
   precision: "16-mixed"
   accelerator: "gpu"
   devices: "auto"
@@ -51,7 +51,7 @@ trainer:
   accumulate_grad_batches: 1
   deterministic: false
   benchmark: true
-  num_sanity_val_steps: 0
+  num_sanity_val_steps: 2
   enable_checkpointing: true
   enable_model_summary: false
 

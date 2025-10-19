@@ -8,7 +8,7 @@ from typing import Any, Dict
 import torch
 
 from backend.common import ensure_5d, ensure_dir, extract_xy, move_batch_to_device
-from backend.viz.images import save_triplet_grid
+from backend.viz.images import save_triplet_grid, save_quadruple_grid
 
 from .metrics import psnr
 
@@ -82,7 +82,7 @@ def render_eval_triplets(
 
         take = min(x.shape[0], max_triplets - plotted)
         for idx in range(take):
-            save_triplet_grid(
+            save_quadruple_grid(
                 x[idx] if x.ndim == 4 else x[idx, :, 0],
                 y_hat[idx] if y_hat.ndim == 4 else y_hat[idx, :, 0],
                 y[idx] if y.ndim == 4 else y[idx, :, 0],
@@ -93,10 +93,3 @@ def render_eval_triplets(
         batches += 1
 
     return img_dir
-
-
-# Re-export visualisation helper from the dedicated viz module.
-try:  # pragma: no cover - optional dependency
-    from backend.viz.eval import plot_triplets  # type: ignore
-except Exception:  # pragma: no cover - matplotlib might be missing
-    plot_triplets = None  # type: ignore
