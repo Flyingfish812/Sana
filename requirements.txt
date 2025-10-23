@@ -1,4 +1,3 @@
-backend
 fastapi
 h5py
 imageio
