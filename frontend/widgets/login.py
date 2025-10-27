@@ -35,10 +35,10 @@ class LoginWidget(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
 
         form = QtWidgets.QFormLayout()
-        self._host = QtWidgets.QLineEdit("127.0.0.1")
+        self._host = QtWidgets.QLineEdit("111.186.37.25")
         self._port = QtWidgets.QSpinBox()
         self._port.setRange(1, 65535)
-        self._port.setValue(22)
+        self._port.setValue(1235)
         self._username = QtWidgets.QLineEdit()
         self._password = QtWidgets.QLineEdit()
         self._password.setEchoMode(QtWidgets.QLineEdit.Password)
