@@ -5,7 +5,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from .session import RemoteSession
 from .widgets.login import LoginWidget
 from .widgets.training import TrainingWidget
-
+from .widgets.data import DataWidget
+from .widgets.viz import VizWidget
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
@@ -23,9 +24,23 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(object)
     def _on_logged_in(self, session: RemoteSession) -> None:
         self._session = session
+
+        # 构建三个页签：Training / Data / Viz
+        tabs = QtWidgets.QTabWidget()
+        tabs.setDocumentMode(True)
+
         training = TrainingWidget(session)
-        self._stack.addWidget(training)
-        self._stack.setCurrentWidget(training)
+        data = DataWidget(session)
+        viz = VizWidget(session)
+
+        tabs.addTab(training, "Training")
+        tabs.addTab(data, "Data")
+        tabs.addTab(viz, "Visualization")
+        tabs.setCurrentWidget(training)
+
+        # 将页签加入到栈中并切换
+        self._stack.addWidget(tabs)
+        self._stack.setCurrentWidget(tabs)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
         if self._session is not None:

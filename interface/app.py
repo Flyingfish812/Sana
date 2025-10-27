@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import inspect
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 from fastapi import FastAPI, HTTPException
@@ -69,6 +70,71 @@ class VisualizationResponse(BaseModel):
     stderr: List[str]
     figures: List[str]
 
+class ParamSpec(BaseModel):
+    name: str
+    type: str | None = None
+    default: Any | None = None
+    required: bool = False
+
+class ModuleSpec(BaseModel):
+    names: List[str]
+    spec: Dict[str, Dict[str, List[ParamSpec]]]  # {name: {"params": [ParamSpec,...]}}
+
+class RegistryResponse(BaseModel):
+    encoder: ModuleSpec
+    propagator: ModuleSpec
+    decoder: ModuleSpec
+    head: ModuleSpec
+
+def _infer_type_str(ann) -> str | None:
+    try:
+        if ann is inspect._empty:
+            return None
+        if getattr(ann, "__name__", None):
+            return ann.__name__
+        return str(ann)
+    except Exception:
+        return None
+
+def _callable_signature_params(fn) -> List[ParamSpec]:
+    try:
+        if inspect.isclass(fn):
+            sig = inspect.signature(fn.__init__)
+            params = list(sig.parameters.values())[1:]  # skip self
+        else:
+            sig = inspect.signature(fn)
+            params = list(sig.parameters.values())
+    except Exception:
+        return []
+    out: List[ParamSpec] = []
+    for p in params:
+        if p.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
+            # **kwargs / *args 不单独展开
+            continue
+        required = p.default is inspect._empty
+        default = None if required else p.default
+        out.append(ParamSpec(
+            name=p.name,
+            type=_infer_type_str(p.annotation),
+            default=default,
+            required=required,
+        ))
+    return out
+
+@app.get("/model/registry", response_model=RegistryResponse)
+def get_model_registry() -> RegistryResponse:
+    # 延迟导入，确保各子模块完成注册
+    from backend.model import factory  # noqa: WPS433
+    # factory.REGISTRY_TYPES: Dict[str, Dict[str, Callable]]
+    result: Dict[str, ModuleSpec] = {}
+    for kind in ("encoder", "propagator", "decoder", "head"):
+        table = factory.REGISTRY_TYPES.get(kind, {})
+        names = sorted(table.keys())
+        spec: Dict[str, Dict[str, List[ParamSpec]]] = {}
+        for name, fn in table.items():
+            spec[name] = {"params": _callable_signature_params(fn)}
+        result[kind] = ModuleSpec(names=names, spec=spec)  # type: ignore
+    return RegistryResponse(**result)
 
 @app.post("/viz/one-click", response_model=VisualizationResponse)
 def visualize_data(payload: VisualizationRequest) -> VisualizationResponse:

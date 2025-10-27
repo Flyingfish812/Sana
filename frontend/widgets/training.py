@@ -13,7 +13,6 @@ from ..session import RemoteSession
 import yaml
 from .config_editor import ConfigEditor
 from ..schemas.train_schema import SCHEMA
-from widgets.image_viewer import ImageViewer
 
 REMOTE_PROJECT_DIR = "~/projects/Sana"
 
@@ -78,35 +77,6 @@ class HttpTrainingWorker(QtCore.QThread):
         finally:
             self.finished_with_status.emit(self._exit_status)
 
-class HttpDataWorker(QtCore.QThread):
-    event = QtCore.Signal(dict)
-    done = QtCore.Signal(int)
-    def __init__(self, session: RemoteSession, payload: dict, parent=None):
-        super().__init__(parent); self._s = session; self._p = payload; self._rc = 0
-    def run(self):
-        try:
-            res = self._s.http_post_json("/data/run", self._p, timeout=120.0)
-            self.event.emit({"type":"status","message":"dataio finished","data":res})
-        except Exception as e:
-            self.event.emit({"type":"error","message":str(e)}); self._rc = 1
-        finally:
-            self.done.emit(self._rc)
-
-class HttpVizWorker(QtCore.QThread):
-    event = QtCore.Signal(dict)
-    done = QtCore.Signal(int)
-    def __init__(self, session: RemoteSession, payload: dict, parent=None):
-        super().__init__(parent); self._s = session; self._p = payload; self._rc = 0
-    def run(self):
-        try:
-            res = self._s.http_post_json("/viz/one-click", self._p, timeout=120.0)
-            # 期望返回格式：{"ok":true, "image_b64":"...", "log":"..."}（占位）
-            self.event.emit({"type":"viz_result","data":res})
-        except Exception as e:
-            self.event.emit({"type":"error","message":str(e)}); self._rc = 1
-        finally:
-            self.done.emit(self._rc)
-
 class TrainingWidget(QtWidgets.QWidget):
     def __init__(self, session: RemoteSession) -> None:
         super().__init__()
@@ -141,6 +111,15 @@ class TrainingWidget(QtWidgets.QWidget):
         form.addRow("Overrides", self._overrides)
         layout.addLayout(form)
 
+        # 配置来源模式
+        mode_box = QtWidgets.QGroupBox("配置来源")
+        hb = QtWidgets.QHBoxLayout(mode_box)
+        self._mode_form = QtWidgets.QRadioButton("使用表单")
+        self._mode_yaml = QtWidgets.QRadioButton("使用 YAML（下方下拉）")
+        self._mode_form.setChecked(True)
+        hb.addWidget(self._mode_form); hb.addWidget(self._mode_yaml); hb.addStretch(1)
+        layout.addWidget(mode_box)
+
         # 运行区域
         self._train_button = QtWidgets.QPushButton("Run Training")
         self._train_button.clicked.connect(self._on_train_clicked)
@@ -157,45 +136,46 @@ class TrainingWidget(QtWidgets.QWidget):
         self._editor.set_schema(SCHEMA)
         self._editor.validityChanged.connect(self._on_editor_validity_changed)
 
-        self._data_btn = QtWidgets.QPushButton("准备数据")
-        self._viz_btn = QtWidgets.QPushButton("一键可视化")
-        self._data_btn.clicked.connect(self._on_data_run_clicked)
-        self._viz_btn.clicked.connect(self._on_viz_clicked)
-        topbar.addWidget(self._data_btn)
-        topbar.addWidget(self._viz_btn)
-
+        try:
+            # 如果 RemoteSession 没有 http_get_json，可改为 http_post_json("/model/registry", {})
+            registry = self._session.http_get_json("/model/registry", timeout=10.0)
+            # 注入到编辑器上下文：供 widget="module" 使用
+            self._editor.set_context({"model_registry": registry})
+            self._append_log("[Model] 已加载模块注册表。")
+        except Exception as exc:
+            self._append_log(f"[Model] 加载注册表失败：{exc}")
+    
     def _on_editor_validity_changed(self, ok: bool):
         # 仅根据校验状态启用/禁用按钮；仍允许用户保存 YAML 预览等操作
         self._train_button.setEnabled(ok)
 
     def _on_train_clicked(self) -> None:
-        if hasattr(self, "_editor") and self._editor is not None:
+        payload: Dict[str, object] = {}
+
+        if self._mode_form.isChecked():
+            # 表单模式：严格依赖编辑器输出
             if not self._editor.is_valid():
                 errs = self._editor.get_errors()
                 self._append_log("[校验未通过] " + "；".join(errs[:3]) + (" ..." if len(errs) > 3 else ""))
                 QtWidgets.QMessageBox.warning(self, "配置有误", "\n".join(errs[:8]))
                 return
-        
-        # 1) 组装 payload（优先使用结构化编辑器；否则使用 config_path）
-        payload: Dict[str, object] = {}
-
-        # 如果批次 A 已引入 ConfigEditor：
-        cfg_from_editor = None
-        if hasattr(self, "_editor") and self._editor is not None:
             try:
                 cfg_from_editor = self._editor.get_cfg()
-                if isinstance(cfg_from_editor, dict) and cfg_from_editor:
-                    payload["config"] = cfg_from_editor
-            except Exception:
-                cfg_from_editor = None  # 容错
-
-        # 若没有结构化 cfg，则退回到 config_path + overrides
-        if "config" not in payload:
-            config_path = self._config_path.text().strip()
-            if not config_path:
-                self._append_log("Config path is required (or provide a valid config in the editor).")
+                if not isinstance(cfg_from_editor, dict) or not cfg_from_editor:
+                    self._append_log("表单未生成有效配置。")
+                    return
+                payload["config"] = cfg_from_editor
+            except Exception as exc:
+                self._append_log(f"表单读取失败：{exc}")
                 return
-            payload["config_path"] = f"{REMOTE_PROJECT_DIR}/{config_path}" if not config_path.startswith("/") and not config_path.startswith("~") else config_path
+
+        else:
+            # YAML 模式：严格使用下拉 YAML（可选 overrides）
+            filename = self._config_combo.currentText().strip()
+            if not filename:
+                self._append_log("请选择一个配置文件。")
+                return
+            payload["config_path"] = f"examples/train_configs/{filename}"
 
             overrides_text = self._overrides.toPlainText().strip()
             if overrides_text:
@@ -204,11 +184,9 @@ class TrainingWidget(QtWidgets.QWidget):
                 except json.JSONDecodeError as exc:
                     self._append_log(f"Invalid overrides JSON: {exc}")
                     return
-                # 把 overrides 合并到 config（后端也能合并，但此处直接下发完整 config 更直观）
+                # 若你希望后端合并，可改为 payload["overrides"]=parsed
                 payload["config"] = parsed
-                # 若你希望由后端合并，可改成 payload["overrides"] = parsed，并在接口侧支持
 
-        # 2) 启动 HTTP 线程
         self._append_log(f"POST /train/run with payload keys: {list(payload.keys())}")
         self._progress.setValue(0)
         self._train_button.setEnabled(False)
@@ -217,46 +195,6 @@ class TrainingWidget(QtWidgets.QWidget):
         self._worker.event_received.connect(self._handle_event)
         self._worker.finished_with_status.connect(self._on_finished)
         self._worker.start()
-
-    def _on_data_run_clicked(self):
-        # 优先用编辑器的 cfg；否则回退到下拉选中的 YAML 路径（让后端自行读取）
-        payload: Dict[str, object] = {}
-        if hasattr(self, "_editor") and self._editor is not None:
-            try:
-                cfg = self._editor.get_cfg()
-                if isinstance(cfg, dict) and cfg:
-                    payload["config"] = cfg
-            except Exception:
-                pass
-        if "config" not in payload:
-            filename = self._config_combo.currentText().strip()
-            if not filename:
-                self._append_log("请选择一个配置文件。")
-                return
-            payload["config_path"] = f"examples/train_configs/{filename}"
-
-        self._append_log("[DATA] POST /data/run …")
-        self._data_btn.setEnabled(False)
-        self._worker_data = HttpDataWorker(self._session, payload, self)
-        self._worker_data.event.connect(self._handle_data_event)
-        self._worker_data.done.connect(self._on_data_done)
-        self._worker_data.start()
-
-    def _handle_data_event(self, ev: dict):
-        t = ev.get("type")
-        if t == "error":
-            self._append_log(f"[DATA][ERROR] {ev.get('message')}")
-        elif t == "status":
-            self._append_log(f"[DATA] {ev.get('message')}")
-            if "data" in ev:
-                # 简单打印返回摘要
-                self._append_log(f"[DATA][RETURN] keys={list(ev['data'].keys())}")
-        else:
-            self._append_log(f"[DATA] {ev}")
-
-    def _on_data_done(self, rc: int):
-        self._append_log(f"[DATA] 完成，rc={rc}")
-        self._data_btn.setEnabled(True)
 
     def _build_command(self, config_path: str, overrides_b64: str | None) -> str:
         pieces = [
@@ -268,54 +206,6 @@ class TrainingWidget(QtWidgets.QWidget):
         if overrides_b64:
             pieces.append(f"--overrides-b64 {shlex.quote(overrides_b64)}")
         return " ".join(pieces)
-    
-    def _on_viz_clicked(self):
-        # 同样优先使用编辑器 cfg（可从中读取 dataset/dls 信息）
-        payload: Dict[str, object] = {}
-        if hasattr(self, "_editor") and self._editor is not None:
-            try:
-                cfg = self._editor.get_cfg()
-                if isinstance(cfg, dict) and cfg:
-                    payload["config"] = cfg
-            except Exception:
-                pass
-        if "config" not in payload:
-            filename = self._config_combo.currentText().strip()
-            if not filename:
-                self._append_log("请选择一个配置文件。")
-                return
-            payload["config_path"] = f"examples/train_configs/{filename}"
-
-        self._append_log("[VIZ] POST /viz/one-click …")
-        self._viz_btn.setEnabled(False)
-        self._worker_viz = HttpVizWorker(self._session, payload, self)
-        self._worker_viz.event.connect(self._handle_viz_event)
-        self._worker_viz.done.connect(self._on_viz_done)
-        self._worker_viz.start()
-
-    def _handle_viz_event(self, ev: dict):
-        t = ev.get("type")
-        if t == "error":
-            self._append_log(f"[VIZ][ERROR] {ev.get('message')}")
-            return
-        if t == "viz_result":
-            data = ev.get("data") or {}
-            log = data.get("log", "")
-            if log:
-                self._append_log("[VIZ][LOG]\n" + log.strip())
-            img_b64 = data.get("image_b64")
-            if img_b64:
-                dlg = ImageViewer(img_b64, title="一键可视化预览", parent=self)
-                dlg.exec()
-            else:
-                self._append_log("[VIZ] 后端未返回 image_b64（占位接口）")
-            return
-        # 兜底
-        self._append_log(f"[VIZ] {ev}")
-
-    def _on_viz_done(self, rc: int):
-        self._append_log(f"[VIZ] 完成，rc={rc}")
-        self._viz_btn.setEnabled(True)
 
     @QtCore.Slot(dict)
     def _handle_event(self, event: Dict[str, object]) -> None:
