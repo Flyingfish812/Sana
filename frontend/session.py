@@ -8,8 +8,6 @@ from typing import Dict, Iterator, Optional
 import paramiko
 import requests
 from urllib.parse import urlunparse
-import json as _json
-import requests
 
 @dataclass
 class SSHCredentials:
@@ -184,3 +182,15 @@ class RemoteSession:
         except Exception:
             # 兜底：可能返回文本
             return {"ok": True, "raw": resp.text}
+        
+    def http_get_json(self, path: str, timeout: float = 10.0):
+        """
+        GET {base_url}{path} 并返回 JSON。用法与 http_post_json 一致。
+        """
+        base = self.get_base_url()
+        url = base + path  # 例如 "/model/registry"
+        headers = {"Content-Type": "application/json"}
+        # 如果你的类里有 token / basic auth，请按 http_post_json 的写法一起加上
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
