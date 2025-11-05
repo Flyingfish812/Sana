@@ -2,7 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Iterator, Tuple
+from typing import Dict, Any, List, Optional, Iterator, Tuple, Union
 import json
 import math
 import io
@@ -49,6 +49,8 @@ class SnapshotIndex:
     batch_first_shapes: Dict[str, List[int]]  # 每样本 shape（不含 batch 维），用于校验/构造内存数据集
     meta: Dict[str, Any]          # 轻量 meta（来自 DataMeta.to_json()）
     compressed: bool              # 是否使用 gzip 压缩
+    factorized_base: bool = True
+    base_mode: str = "clean"
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -60,6 +62,8 @@ class SnapshotIndex:
             "batch_first_shapes": self.batch_first_shapes,
             "meta": self.meta,
             "compressed": self.compressed,
+            "factorized_base": self.factorized_base,
+            "base_mode": self.base_mode,
         }
 
 # --------------------
@@ -79,12 +83,14 @@ class DataloaderSnapshotWriter:
         target_part_bytes: int = 1 << 30,  # ~1GB
         overwrite: bool = True,
         gzip_compress: bool = False,
+        base_mode: str = "clean",
     ):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.overwrite = overwrite
         self.target_part_bytes = max(64 << 20, target_part_bytes)  # 不小于 64MB
         self.gzip = gzip_compress
+        self._base_mode = str(base_mode)
 
         self._parts: List[Dict[str, Any]] = []
         self._buffers: Dict[str, List[torch.Tensor]] = {"x": [], "y": [], "cond": []}
@@ -188,7 +194,7 @@ class DataloaderSnapshotWriter:
     def close(self) -> SnapshotIndex:
         self._flush()
         index = SnapshotIndex(
-            version=1,
+            version=2,
             parts=self._parts,
             total_samples=self._total_samples,
             total_nbytes_uncompressed=self._total_bytes,
@@ -196,6 +202,8 @@ class DataloaderSnapshotWriter:
             batch_first_shapes=self._batch_first_shapes,
             meta=self._meta_cache or {},
             compressed=self.gzip,
+            factorized_base=True,
+            base_mode=self._base_mode,
         )
         with open(self.out_dir / "snapshot_index.json", "w", encoding="utf-8") as f:
             json.dump(index.to_json(), f, ensure_ascii=False, indent=2)
@@ -311,6 +319,75 @@ def load_snapshot_as_dataloader(
         ds = _ShardIterator(str(p), parts, compressed)
         dl = DataLoader(ds, batch_size=batch_size, num_workers=num_workers, **loader_kwargs)  # 不传 shuffle
         return dl, {"mode": "streaming", "parts": len(parts)}
+
+def load_snapshot_as_base_dataset(
+    dir_path: str,
+    *,
+    max_ram_gb: Optional[float] = None,
+    force_streaming: bool = False,
+) -> Tuple[torch.utils.data.Dataset, Dict[str, Any]]:
+    """
+    从快照目录恢复“基础 Dataset”（不直接构造 DataLoader）。
+    - 若内存允许（或未强制流式），整载入所有分片并拼为大张量，返回 _InMemoryTensorDataset
+    - 否则返回流式 _ShardIterator（IterableDataset）
+    返回 (dataset, info)；info 含：
+      - "mode": "in_memory" | "streaming"
+      - "num_samples": int （仅 in_memory 时提供）
+      - "parts": int
+      - "keys": List[str]
+      - "batch_first_shapes": Dict[str, List[int]]
+      - "factorized_base": bool
+      - "base_mode": str
+    """
+    p = Path(dir_path)
+    idx_path = p / "snapshot_index.json"
+    if not idx_path.exists():
+        raise FileNotFoundError(f"snapshot_index.json not found under {dir_path}")
+    with open(idx_path, "r", encoding="utf-8") as f:
+        idx = json.load(f)
+
+    total_bytes = idx["total_nbytes_uncompressed"]
+    parts = idx["parts"]
+    keys = idx["keys"]
+    compressed = bool(idx.get("compressed", False))
+
+    def _bytes_to_gb(b: int) -> float:
+        return b / (1 << 30)
+
+    can_in_memory = (not force_streaming) and (
+        (max_ram_gb is None) or (_bytes_to_gb(total_bytes) <= max_ram_gb)
+    )
+
+    # 构造 info（无论 in_memory/streaming）
+    info = {
+        "parts": len(parts),
+        "keys": list(keys),
+        "batch_first_shapes": dict(idx.get("batch_first_shapes", {})),
+        "factorized_base": bool(idx.get("factorized_base", True)),
+        "base_mode": str(idx.get("base_mode", idx.get("meta", {}).get("base_mode", "clean"))),
+        "version": int(idx.get("version", 1)),
+    }
+
+    if can_in_memory and len(parts) > 0:
+        buffers: Dict[str, List[torch.Tensor]] = {k: [] for k in keys}
+        for it in parts:
+            fn = it["file"]
+            fp = p / fn
+            if compressed:
+                with gzip.open(fp, "rb") as gz:
+                    payload = _safe_torch_load(io.BytesIO(gz.read()), map_location="cpu")
+            else:
+                payload = _safe_torch_load(fp, map_location="cpu")
+            for k in keys:
+                buffers[k].append(payload[k])
+        stacked: Dict[str, torch.Tensor] = {k: torch.cat(vs, dim=0) for k, vs in buffers.items() if len(vs) > 0}
+        ds = _InMemoryTensorDataset(**stacked)
+        info.update({"mode": "in_memory", "num_samples": len(ds)})
+        return ds, info
+    else:
+        ds = _ShardIterator(str(p), parts, compressed)
+        info.update({"mode": "streaming"})
+        return ds, info
 
 # --------------------
 # 内存数据集

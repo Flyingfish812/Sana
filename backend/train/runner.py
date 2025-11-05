@@ -41,11 +41,25 @@ def _trainer_from_cfg(cfg: Dict, loggers, callbacks):
     kw = {k: v for k, v in tcfg.items() if k in safe_keys and v is not None}
     return pl.Trainer(logger=loggers, callbacks=callbacks, **kw)
 
+# 用于把 (p, sigma) 转成稳定、可排序的 run 目录后缀
+def _format_run_suffix(p: Optional[float], sigma: Optional[float]) -> str:
+    """
+    将 p（采样密度）与 sigma（观测噪声）转为后缀，例如：
+    p=0.05, sigma=0.01 -> "p05_s010"
+    若为 None 则使用 "p--" 或 "s---" 占位，避免冲突。
+    """
+    def _p(v):
+        return f"p{int(round(v * 100)):02d}" if v is not None else "p--"
+    def _s(v):
+        return f"s{int(round(v * 1000)):03d}" if v is not None else "s---"
+    return f"{_p(p)}_{_s(sigma)}"
+
 def run_training(
     cfg: Dict,
     train_dl: Optional[DataLoader] = None,
     val_dl: Optional[DataLoader] = None,
     test_dl: Optional[DataLoader] = None,
+    run_suffix: Optional[str] = None,
 ) -> Tuple[EPDSystem, Dict[str, str]]:
     import torch
     try:
@@ -55,6 +69,16 @@ def run_training(
     
     """支持：显式注入 dataloaders 或按 cfg.data 自动读取"""
     cfg = load_config(cfg)
+
+    if run_suffix:
+        base_ver = cfg["logging"].get("version")
+        if base_ver is None:
+            # 理论上 load_config 已填充 version，这里兜底
+            import datetime as dt
+            base_ver = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            cfg["logging"]["version"] = base_ver
+        cfg["logging"]["version"] = f"{cfg['logging']['version']}/{run_suffix}"
+
     strategy = cfg["trainer"].get("strategy")
     strategy_name = strategy.lower() if isinstance(strategy, str) else ""
 
@@ -128,6 +152,8 @@ def run_training(
                 best_ckpt = candidates[0]
 
     if eval_enabled:
+        eval_cfg = dict(eval_cfg)
+        eval_cfg["factors"] = cfg.get("data", {}).get("factors", {})
         model.eval()
         eval_vis = render_eval_triplets(model, test_dl, run_dir, eval_cfg)
         evaluate(model, test_dl, run_dir, eval_cfg)

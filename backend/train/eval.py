@@ -12,17 +12,22 @@ from backend.viz.images import save_triplet_grid, save_quadruple_grid
 
 from .metrics import psnr
 
-
 @torch.no_grad()
 def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
     """Evaluate ``model`` on ``test_dl`` and append metrics to ``eval_log.jsonl``."""
-
     if test_dl is None:
         return
 
     log_path = run_dir / "eval_log.jsonl"
     device = next(model.parameters()).device
     limit = int(cfg_eval.get("num_eval_batches", 3))
+
+    # 从全局 cfg_eval 中拿不到 data.factors，这里容忍调用方把 data.factors 打进 cfg_eval 或者
+    # 直接读取 run_dir 下冻结的 config.dump.yaml（不强依赖）。
+    # 简洁起见：尝试 cfg_eval["factors"]，否则写 None。
+    factors = cfg_eval.get("factors", {})
+    p = factors.get("sample_density", None) if isinstance(factors, dict) else None
+    sigma = factors.get("noise_sigma", None) if isinstance(factors, dict) else None
 
     with log_path.open("a", encoding="utf-8") as fp:
         for batch_idx, batch in enumerate(test_dl):
@@ -40,9 +45,9 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
                 y_for_metric = y_hat
 
             value = float(psnr(y_for_metric, y).detach().cpu().item())
-            fp.write(json.dumps({"psnr": value}) + "\n")
+            rec = {"psnr": value, "p": p, "sigma": sigma}
+            fp.write(json.dumps(rec) + "\n")
             fp.flush()
-
 
 @torch.no_grad()
 def render_eval_triplets(

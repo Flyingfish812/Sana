@@ -194,6 +194,20 @@ def summarise_pipeline(dataset_result: DatasetBuildResult, dataloader):
     }
     return summary
 
+def get_base_dataset_from_snapshot(
+    snapshot_dir: str,
+    *,
+    max_ram_gb: Optional[float] = None,
+    force_streaming: bool = False,
+):
+    from .cache.snapshot import load_snapshot_as_base_dataset
+    dataset, info = load_snapshot_as_base_dataset(
+        snapshot_dir,
+        max_ram_gb=max_ram_gb,
+        force_streaming=force_streaming,
+    )
+    return dataset, info
+
 def run(config: Dict[str, Any]):
     """
     轻量化一键入口：只需准备一个 config，即可：

@@ -84,7 +84,24 @@ def _deep_update(base: Dict, extra: Dict) -> Dict:
 def load_config(cfg: Dict) -> Dict:
     """接受 dict（来自 YAML 或已合并）→ 叠加默认值 → 基础校验 → 返回新 dict"""
     assert isinstance(cfg, dict), "cfg must be a dict (load YAML first if needed)"
-    merged = _deep_update(DEFAULT_CFG, cfg)
+    # --- 新增默认字段：data.factors 与 data.sweep ---
+    DEFAULT_WITH_FACTORS = copy.deepcopy(DEFAULT_CFG)
+    # 单轮注入用的默认 p / σ
+    DEFAULT_WITH_FACTORS["data"].setdefault("factors", {
+        "sample_density": None,   # None 表示不改写（沿用干净快照或数据层默认）
+        "noise_sigma": None,      # None 表示不加噪
+        "rng_seed_offset": 0,     # 用于不同组合的可复现派生
+    })
+    # 多轮 sweep（批次C会用到；此处先加默认，启用与否不影响单轮）
+    DEFAULT_WITH_FACTORS["data"].setdefault("sweep", {
+        "enable": False,
+        "p_list": [],
+        "sigma_list": [],
+        "mode": "grid",
+        "reuse_snapshot": True,   # 在已有 run 的 from_run_dir 时，优先复用数据来源而非 pickled dataloader
+    })
+
+    merged = _deep_update(DEFAULT_WITH_FACTORS, cfg)
 
     # 填充 logging.name/version
     if merged["logging"]["name"] is None:
@@ -102,5 +119,16 @@ def load_config(cfg: Dict) -> Dict:
     for sec in ["encoder", "propagator", "decoder", "head"]:
         if "name" not in merged["model"][sec]:
             raise KeyError(f"model.{sec}.name required")
+
+    # 简要校验 factors（允许 None）
+    fac = merged["data"].get("factors", {})
+    p = fac.get("sample_density", None)
+    if p is not None:
+        if not (0.0 < float(p) <= 1.0):
+            raise ValueError(f"data.factors.sample_density must be in (0,1], got {p}")
+    sigma = fac.get("noise_sigma", None)
+    if sigma is not None:
+        if float(sigma) < 0.0:
+            raise ValueError(f"data.factors.noise_sigma must be >= 0, got {sigma}")
 
     return merged

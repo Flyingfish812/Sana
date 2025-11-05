@@ -40,10 +40,25 @@ def _with_loader_opts(dl: DataLoader, cfg: Dict) -> DataLoader:
         **opts,
     )
 
-def _build_via_builder(builder: str, builder_args: Dict) -> Tuple[DataLoader, Optional[DataLoader], DataLoader]:
+def _build_via_builder(builder: str, builder_args: Dict, data_cfg: Dict) -> Tuple[DataLoader, Optional[DataLoader], DataLoader]:
+    """
+    通过 builder 构建 dataloaders。
+    在此处把 config.data.factors 合并进入 builder_args（仅覆盖 None 的字段不生效）。
+    """
+    # 合并 factors
+    factors = (data_cfg or {}).get("factors", {}) or {}
+    ba = dict(builder_args or {})
+    # 仅当用户提供了有效数值时才覆盖
+    if factors.get("sample_density") is not None:
+        ba["sample_density"] = float(factors["sample_density"])
+    if factors.get("noise_sigma") is not None:
+        ba["noise_sigma"] = float(factors["noise_sigma"])
+    if factors.get("rng_seed_offset") is not None:
+        ba["rng_seed_offset"] = int(factors["rng_seed_offset"])
+
     module, fn = builder.split(":")
     func = getattr(import_module(module), fn)
-    out = func(**(builder_args or {}))
+    out = func(**ba)
     if isinstance(out, dict):
         return out.get("train"), out.get("val"), out.get("test")
     return out
@@ -152,6 +167,9 @@ def build_dataloaders(
     统一数据入口：
       - 优先使用 injected（三个 DataLoader 任意一个非 None 即启用注入模式）；
       - 否则按 config.data：from_run_dir → builder → snapshot_dir。
+    其中：
+      - 当存在 data.factors 时，会在“builder 路径”将其注入 builder_args；
+      - from_run_dir 若解析到 snapshot_dir，则继续按“snapshot_dir 路径”构建（保持你的原优先级）。
     """
     # A) 显式注入（Notebook 里传入）
     if injected and any(d is not None for d in injected):
@@ -162,9 +180,14 @@ def build_dataloaders(
     # B) from_run_dir
     if data_cfg.get("from_run_dir"):
         snap, dls = _resolve_from_run_dir(data_cfg["from_run_dir"])
-        if dls is not None:
+        # 若历史 run 中已经有 pickled dataloaders，且本次没有强制要求复用 snapshot 来源，则可直接返回
+        reuse_snapshot = bool(data_cfg.get("sweep", {}).get("reuse_snapshot", True))
+        has_factors = any([(data_cfg.get("factors", {}) or {}).get(k) is not None for k in ("sample_density", "noise_sigma")])
+        # 若需要按 p/σ 重新注入，或者策略要求复用 snapshot 来源，则不要直接复用 pickled dataloaders
+        if dls is not None and not (reuse_snapshot or has_factors):
             return dls
         if snap:
+            # 走 snapshot_dir 分支
             train_dl, val_dl, test_dl = build_from_snapshot(snap, data_cfg)
             train_dl = _with_loader_opts(train_dl, data_cfg)
             val_dl = _with_loader_opts(val_dl, data_cfg) if val_dl is not None else None
@@ -174,7 +197,11 @@ def build_dataloaders(
 
     # C) builder（推荐）
     if data_cfg.get("builder"):
-        train_dl, val_dl, test_dl = _build_via_builder(data_cfg["builder"], data_cfg.get("builder_args", {}))
+        train_dl, val_dl, test_dl = _build_via_builder(
+            data_cfg["builder"],
+            data_cfg.get("builder_args", {}),
+            data_cfg
+        )
         train_dl = _with_loader_opts(train_dl, data_cfg)
         val_dl = _with_loader_opts(val_dl, data_cfg) if val_dl is not None else None
         test_dl = _with_loader_opts(test_dl, data_cfg)
