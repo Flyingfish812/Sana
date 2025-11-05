@@ -9,6 +9,31 @@ import gzip
 import io
 from torch.utils.data import DataLoader, TensorDataset
 
+def _json_find_first(d, keys=('layout_tag', 'layout', 'sampler', 'sampling', 'strategy')):
+    """
+    在嵌套 dict/list 结构里递归寻找第一个可能代表“布局/采样策略”的字段，返回字符串或 None。
+    这是启发式的：不同数据准备流水线可能把该信息写在不同键位。
+    """
+    try:
+        if isinstance(d, dict):
+            # 直接命中优先
+            for k in keys:
+                if k in d and isinstance(d[k], (str, int, float)):
+                    return str(d[k])
+            # 递归扫描
+            for v in d.values():
+                ans = _json_find_first(v, keys)
+                if ans is not None:
+                    return ans
+        elif isinstance(d, list):
+            for v in d:
+                ans = _json_find_first(v, keys)
+                if ans is not None:
+                    return ans
+    except Exception:
+        pass
+    return None
+
 def _load_split_loader(split_dir: Path, loader_cfg: Dict) -> Optional[DataLoader]:
     """
     加载单个 split (train/val/test) 的 DataLoader。
@@ -30,6 +55,25 @@ def _load_split_loader(split_dir: Path, loader_cfg: Dict) -> Optional[DataLoader
             pin_memory=loader_cfg.get("pin_memory", True),
             persistent_workers=loader_cfg.get("persistent_workers", False),
         )
+        try:
+            meta_tag = loader_cfg.get("layout_tag", None)
+            # 若没手动传，尝试 snapshot_index.json 里找线索
+            if meta_tag is None:
+                if snap_idx.exists():
+                    with open(snap_idx, "r", encoding="utf-8") as f:
+                        j = json.load(f)
+                    meta_tag = _json_find_first(j)
+
+            if getattr(dl, "dataset", None) is not None:
+                ds = dl.dataset
+                # 给 dataset 追加/合并 meta
+                old = getattr(ds, "meta", None)
+                if isinstance(old, dict):
+                    old.setdefault("layout_tag", meta_tag)
+                else:
+                    setattr(ds, "meta", {"layout_tag": meta_tag})
+        except Exception:
+            pass
         return dl
 
     # -------- (2) 兜底：没有 snapshot_index.json，但有分片文件 → 手工拼接 --------
@@ -62,6 +106,7 @@ def _load_split_loader(split_dir: Path, loader_cfg: Dict) -> Optional[DataLoader
             return None  # 没有任何张量就返回空，交由上层报错
 
         ds = TensorDataset(*tensors)
+        
         return DataLoader(
             ds,
             batch_size=loader_cfg.get("batch_size", 8),
@@ -77,7 +122,7 @@ def _load_split_loader(split_dir: Path, loader_cfg: Dict) -> Optional[DataLoader
         obj = torch.load(ds_pt, map_location="cpu")
         if isinstance(obj, dict) and obj.get("__type__") == "TensorDataset":
             obj = TensorDataset(*obj["tensors"])
-        return DataLoader(
+        dl = DataLoader(
             obj,
             batch_size=loader_cfg.get("batch_size", 8),
             num_workers=loader_cfg.get("num_workers", 4),
@@ -85,6 +130,30 @@ def _load_split_loader(split_dir: Path, loader_cfg: Dict) -> Optional[DataLoader
             persistent_workers=loader_cfg.get("persistent_workers", False),
             shuffle=("train" in split_dir.name.lower()),
         )
+        try:
+            meta_tag = loader_cfg.get("layout_tag", None)
+            meta_file = split_dir / "meta.json"
+            if meta_tag is None and meta_file.exists():
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    j = json.load(f)
+                meta_tag = _json_find_first(j)
+            if meta_tag is None:
+                snap_idx2 = split_dir / "snapshot_index.json"
+                if snap_idx2.exists():
+                    with open(snap_idx2, "r", encoding="utf-8") as f:
+                        j = json.load(f)
+                    meta_tag = _json_find_first(j)
+
+            if getattr(dl, "dataset", None) is not None:
+                ds = dl.dataset
+                old = getattr(ds, "meta", None)
+                if isinstance(old, dict):
+                    old.setdefault("layout_tag", meta_tag)
+                else:
+                    setattr(ds, "meta", {"layout_tag": meta_tag})
+        except Exception:
+            pass
+        return dl
 
     return None
 

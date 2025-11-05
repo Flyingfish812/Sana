@@ -63,7 +63,32 @@ DEFAULT_CFG: Dict[str, Any] = {
         "lr_monitor": {"enable": True, "logging_interval": "epoch"},
         "viz_triplets": {"enable": False, "every_n_steps": 200, "num_triplets": 4},
     },
-    "eval": {"enable": True, "num_eval_batches": 3, "num_plot_triplets": 6},
+    "eval": {
+        "enable": True,
+        "num_eval_batches": 3,
+        "num_plot_triplets": 6,
+        "metrics": ["psnr", "ssim", "corrcoef", "l1", "mse", "grad_mse", "lap_mse"],  # 要计算的指标清单（留空或缺省则退回到只算PSNR）
+
+        # 多尺度（高斯金字塔）评估
+        "scales": {
+            "enable": False,
+            "levels": 3,      # 生成 L0..L{levels-1}，L0为原分辨率
+            "sigma": 1.6      # 金字塔平滑的基础sigma（实现里用blur+下采样近似）
+        },
+
+        # 频域评估（径向功率谱/相对误差），需要 spectral.py
+        "spectral": {
+            "enable": False,
+            "kbins": 32,
+            "fft_pad": True
+        },
+
+        # 从 batch 或 dataset.meta 提取采样布局标签的键
+        "layout_tag_key": "layout_tag",
+
+        # 是否把逐样本度量也写入log（默认只写 batch 聚合）
+        "write_per_item": False
+    },
     "train": {"seed": 2025},
 }
 
