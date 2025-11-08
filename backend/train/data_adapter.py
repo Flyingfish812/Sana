@@ -43,12 +43,11 @@ def _with_loader_opts(dl: DataLoader, cfg: Dict) -> DataLoader:
 def _build_via_builder(builder: str, builder_args: Dict, data_cfg: Dict) -> Tuple[DataLoader, Optional[DataLoader], DataLoader]:
     """
     通过 builder 构建 dataloaders。
-    在此处把 config.data.factors 合并进入 builder_args（仅覆盖 None 的字段不生效）。
+    在此处把 config.data.factors 与常用的 DataLoader 选项合并进入 builder_args。
     """
-    # 合并 factors
+    # 1) 合并 factors
     factors = (data_cfg or {}).get("factors", {}) or {}
     ba = dict(builder_args or {})
-    # 仅当用户提供了有效数值时才覆盖
     if factors.get("sample_density") is not None:
         ba["sample_density"] = float(factors["sample_density"])
     if factors.get("noise_sigma") is not None:
@@ -56,6 +55,13 @@ def _build_via_builder(builder: str, builder_args: Dict, data_cfg: Dict) -> Tupl
     if factors.get("rng_seed_offset") is not None:
         ba["rng_seed_offset"] = int(factors["rng_seed_offset"])
 
+    # 2) 合并常用 DataLoader 选项（保持与 snapshot_dir 分支一致）
+    for k in ("batch_size", "num_workers", "pin_memory", "persistent_workers",
+              "prefetch_factor", "drop_last", "shuffle", "split"):
+        if k in (data_cfg or {}):
+            ba[k] = data_cfg[k]
+
+    # 3) 动态导入并调用
     module, fn = builder.split(":")
     func = getattr(import_module(module), fn)
     out = func(**ba)

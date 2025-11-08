@@ -79,7 +79,7 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
         metric_names = ["psnr"]
 
     # 注册指标函数
-        METRIC_FNS = {
+    METRIC_FNS = {
         "l1": M.l1, "mse": M.mse, "psnr": M.psnr,
         "corrcoef": M.corrcoef, "ssim": M.ssim,
         "grad_mse": getattr(M, "grad_mse", None),

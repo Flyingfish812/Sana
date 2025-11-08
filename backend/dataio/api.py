@@ -20,6 +20,7 @@ from .dataset.collate import make_collate
 from .schema import DataMeta
 from .dataset.subset import SubsetDataset
 from .sampling.splits import split_indices
+from backend.train.data_adapter_snapshot import build_from_snapshot
 
 @dataclass
 class DatasetBuildResult:
@@ -293,3 +294,163 @@ def run(config: Dict[str, Any]):
                 pass
 
     return dataset, dataloader, summary
+
+def build_all(
+    *,
+    snapshot_dir: str,
+    # 因子化注入（训练侧会把 data.factors 合并注入到这里）
+    sample_density: Optional[float] = None,
+    noise_sigma: Optional[float] = None,
+    rng_seed_offset: int = 0,
+    # DataLoader 相关参数（训练侧 data.* 会透传到这里；若未传则用默认）
+    batch_size: int = 32,
+    num_workers: int = 8,
+    pin_memory: bool = True,
+    persistent_workers: bool = True,
+    prefetch_factor: Optional[int] = 4,
+    drop_last: bool = False,
+    shuffle: bool = True,
+    split: Optional[Dict[str, Any]] = None,
+    # 允许冗余参数（从 data_cfg 透传进来，不影响逻辑）
+    **data_cfg,
+) -> Tuple[DataLoader, Optional[DataLoader], DataLoader]:
+    """
+    v2 统一数据入口（builder 模式）：
+      1) 先用 v1 的 build_from_snapshot 恢复基础 train/val/test DataLoader；
+      2) 在不改变样本划分的前提下，用本地 adapter collate 构造“三输入通道”（recon / mask / obs*mask），
+         目标保持单通道（与 v1 兼容：target_channels=["u"]）；
+      3) 返回新的 train/val/test 三个 DataLoader。
+    """
+    import random
+    import torch
+
+    # 容错：目录别名（用户若传了 nc_full，尝试 nc_full_v2）
+    if not os.path.isdir(snapshot_dir):
+        alt = snapshot_dir.rstrip("/\\") + "_v2"
+        if os.path.isdir(alt):
+            snapshot_dir = alt
+
+    # ---------- 第一步：用 v1 的逻辑从快照恢复基础 dataloaders ----------
+    # 注意：此处先不给任何自定义 collate，让它按快照恢复最原始的样本结构（dict：含 'u','v' 等）
+    #       随后我们用自己的 collate 替换，以构造三输入通道。
+    base_train, base_val, base_test = build_from_snapshot(snapshot_dir, {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+        "prefetch_factor": prefetch_factor,
+        "drop_last": drop_last,
+        "shuffle": shuffle,
+        "split": split or data_cfg.get("split") or {"enable": True, "strategy": "temporal",
+                                                    "unit": "frame",
+                                                    "ratios": {"train": 0.8, "val": 0.1, "test": 0.1},
+                                                    "seed": 123}
+    })
+
+    # ---------- 第二步：p-σ 因子注入 + 三输入通道（样本级映射，保持原 collate 不变） ----------
+    import torch
+    from torch.utils.data import Dataset
+
+    base_channel = data_cfg.get("base_channel", "u")          # 与 v1 约定保持一致
+    target_channels = data_cfg.get("target_channels", ["u"])  # 目前保持单通道预测
+
+    rng = np.random.RandomState(1234 + int(rng_seed_offset))
+    torch.manual_seed(1234 + int(rng_seed_offset))
+
+    def _make_mask_like(arr_hw, p: Optional[float]):
+        if p is None or p <= 0.0:
+            return np.zeros(arr_hw, dtype=np.uint8)
+        h, w = arr_hw
+        num = int(round(p * h * w))
+        idx = rng.choice(h * w, size=num, replace=False)
+        mask = np.zeros(h * w, dtype=np.uint8)
+        mask[idx] = 1
+        return mask.reshape(h, w)
+
+    def _naive_inpaint(observed_map, mask):
+        if mask.sum() == 0:
+            return np.zeros_like(observed_map, dtype=observed_map.dtype)
+        mean_val = observed_map[mask > 0].mean()
+        out = observed_map.copy()
+        out[mask == 0] = mean_val
+        return out
+
+    def _to_numpy(arr):
+        import numpy as _np
+        import torch as _torch
+        if isinstance(arr, _torch.Tensor):
+            return arr.detach().cpu().numpy()
+        return _np.asarray(arr)
+
+    class _MappedDataset(Dataset):
+        """对 base_dataset 做样本级映射：生成三输入通道 x 和单通道目标 y。
+        不改 collate，让下游保持 batch.x / batch.y 的属性访问行为。"""
+        def __init__(self, base_ds):
+            self.base = base_ds
+        def __len__(self):
+            return len(self.base)
+        def __getitem__(self, idx):
+            sample = self.base[idx]
+
+            # 取“干净底图”u_map：兼容两种快照规范
+            # A) {'u': HxW, 'v': HxW, ...}
+            # B) {'x': CxHxW, 'y': C'xHxW}（干净底稿：用 y 的第 0 通道作为底图）
+            if base_channel in sample:
+                u_map = _to_numpy(sample[base_channel]).astype(np.float32)
+                if u_map.ndim == 3 and u_map.shape[0] == 1:
+                    u_map = u_map[0]
+            elif "y" in sample:
+                y0 = _to_numpy(sample["y"]).astype(np.float32)
+                if y0.ndim == 2:
+                    u_map = y0
+                elif y0.ndim == 3:
+                    u_map = y0[0]
+                else:
+                    raise ValueError(f"Unsupported 'y' shape {y0.shape} in snapshot sample.")
+            else:
+                raise KeyError(f"Snapshot sample missing base channel '{base_channel}' and key 'y'. Keys={list(sample.keys())}")
+
+            H, W = u_map.shape[-2], u_map.shape[-1]
+            mask = _make_mask_like((H, W), sample_density)
+
+            obs = u_map.astype(np.float32).copy()
+            if noise_sigma is not None and noise_sigma > 0.0:
+                obs = obs + rng.normal(0.0, float(noise_sigma), size=obs.shape).astype(np.float32)
+
+            obs_times_mask = obs * mask.astype(np.float32)
+            recon = _naive_inpaint(obs_times_mask, mask)
+
+            x = np.stack([recon, mask.astype(np.float32), obs_times_mask], axis=0).astype(np.float32)
+            y = u_map.astype(np.float32)[None, ...]  # 单通道目标
+
+            # IMPORTANT: 返回 dict（与 v1 快照样本契约一致：per-sample 是 dict）
+            # 原有 collate 会把 batch 封装成支持 batch.x / batch.y 的对象；不要在这里改成别的类型。
+            return {"x": x, "y": y}
+
+    # ---------- 第三步：复用“原始 dataloader 的 collate_fn”，仅替换 dataset 与常用 loader 选项 ----------
+    def _rebuild_like(base_dl: Optional[DataLoader]) -> Optional[DataLoader]:
+        if base_dl is None:
+            return None
+        ds = _MappedDataset(base_dl.dataset)
+        # 沿用 v1 的 collate_fn（它会把 batch 封装为支持属性访问的对象）
+        collate_fn = base_dl.collate_fn
+
+        # 覆盖常用选项；其余沿用基础 loader 的 worker 等特性
+        opts = dict(
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=(persistent_workers if (num_workers and num_workers > 0) else False),
+            shuffle=getattr(base_dl, "shuffle", shuffle),
+            drop_last=drop_last,
+            collate_fn=collate_fn,
+        )
+        if prefetch_factor is not None and num_workers and num_workers > 0:
+            opts["prefetch_factor"] = prefetch_factor
+        return DataLoader(ds, **opts)
+
+    train_dl = _rebuild_like(base_train)
+    val_dl   = _rebuild_like(base_val)
+    test_dl  = _rebuild_like(base_test or base_val)  # 若无 test，用 val 兜底
+
+    return train_dl, val_dl, test_dl
