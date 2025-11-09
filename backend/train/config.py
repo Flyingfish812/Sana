@@ -83,6 +83,23 @@ DEFAULT_CFG: Dict[str, Any] = {
             "fft_pad": True
         },
 
+        # 多尺度参考匹配（核-尺度网格）
+        "multiscale_ref": {
+            "enable": False,                  # 主开关
+            "kernel_sizes": [3, 5, 7, 9, 11], # 参照尺度集合（奇数核）
+            # 参考生成方式：
+            # - avgpool_up: 用 avg_pool2d(k,stride=k) 下采样，再上采样回原分辨率
+            # - gauss_down_up: 高斯平滑 + 下采样（步长=k），再上采样
+            # - blur_only: 仅平滑（不下采样，上采样无效）
+            "ref_mode": "gauss_down_up",
+            # 上采样插值方式（仅 *_up 模式有效）
+            "upsample": "bicubic",            # "bilinear" | "nearest" 也可
+            # 比较指标（留空则沿用 eval.metrics）
+            "metrics": [],
+            # 记录曲线（每个指标随 k 的分数）用于抽查质检；默认关闭以节省体积
+            "dump_curves": False,
+        },
+
         # 从 batch 或 dataset.meta 提取采样布局标签的键
         "layout_tag_key": "layout_tag",
 

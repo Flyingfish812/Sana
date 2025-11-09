@@ -55,6 +55,7 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
       - 相对误差标量：nmse/nmae；
       - 区域误差统计：region_nmse_max/mean 或 region_nmae_max/mean；
       - 逐像素相对误差分位数：rel_err_max/rel_err_pXX；
+      - 多尺度参考匹配：best_k_<metric> 与 at_best_<metric>
     频域与多尺度逻辑保持兼容。
     """
     if test_dl is None:
@@ -78,7 +79,7 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
 
     # 新增配置：相对尺度与区域/分位
     rel_cfg   = cfg_eval.get("rel_error", {})
-    use_rel   = bool(rel_cfg.get("enable", True))               # 默认启用相对误差标量
+    use_rel   = bool(rel_cfg.get("enable", True))
     pct_list  = tuple(rel_cfg.get("percentiles", [95, 99]))
 
     region_cfg = cfg_eval.get("region_error", {})
@@ -86,8 +87,19 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
     tiles      = tuple(region_cfg.get("tiles", [3, 3]))
     region_use_nmse = bool(region_cfg.get("use_nmse", True))
 
+    # 新增配置：多尺度参考匹配
+    ms_cfg       = cfg_eval.get("multiscale_ref", {}) or {}
+    ms_enable    = bool(ms_cfg.get("enable", False))
+    ms_kernels   = list(ms_cfg.get("kernel_sizes", [3,5,7,9,11]))
+    ms_ref_mode  = str(ms_cfg.get("ref_mode", "gauss_down_up"))
+    ms_upsample  = str(ms_cfg.get("upsample", "bicubic"))
+    ms_metrics   = list(ms_cfg.get("metrics", [])) or []
+    ms_dump_curv = bool(ms_cfg.get("dump_curves", False))
+
     if not metric_names:
         metric_names = ["psnr"]
+    if not ms_metrics:
+        ms_metrics = list(metric_names)  # 沿用主指标集合
 
     METRIC_FNS = {
         "l1": M.l1, "mse": M.mse, "psnr": M.psnr,
@@ -116,6 +128,7 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
             yh4 = y_hat.squeeze(2) if y_hat.ndim == 5 else y_hat
 
             record: Dict[str, Any] = {}
+            # —— 基础指标 ——
             for name in metric_names:
                 fn = METRIC_FNS.get(name, None)
                 if fn is None:
@@ -129,7 +142,7 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
                 except Exception:
                     pass
 
-            # 多尺度
+            # —— 多层级金字塔（原有功能，保持） ——
             if use_scales and n_levels > 1:
                 pyr_pred = _build_pyramid(yh4, n_levels)
                 pyr_tgt  = _build_pyramid(y4,  n_levels)
@@ -143,7 +156,7 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
                         except Exception:
                             pass
 
-            # 频域指标（保持原貌）
+            # —— 频域指标（原有功能，保持） ——
             if use_spectral and S is not None:
                 try:
                     spec = S.spectral_rrmse(yh4, y4, kbins=kbins, fft_pad=fft_pad)
@@ -155,7 +168,7 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
                 except Exception:
                     pass
 
-            # 新增：整体相对误差（nmse/nmae 已在上面 metrics；若未列入 metrics 仍可强制补充）
+            # —— 相对误差 / 区域误差（原有功能，保持） ——
             if use_rel:
                 if "nmse" not in record and METRIC_FNS.get("nmse"):
                     try: record["nmse"] = float(METRIC_FNS["nmse"](yh4, y4).detach().cpu().item())
@@ -163,28 +176,41 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
                 if "nmae" not in record and METRIC_FNS.get("nmae"):
                     try: record["nmae"] = float(METRIC_FNS["nmae"](yh4, y4).detach().cpu().item())
                     except Exception: pass
-                # 逐像素相对误差的极值/分位数
                 try:
                     record.update(_relative_error_stats(yh4, y4, percentiles=pct_list))
                 except Exception:
                     pass
 
-            # 新增：区域误差统计
             if use_region:
                 try:
                     record.update(_region_error_tiles(yh4, y4, tiles=tiles, use_nmse=region_use_nmse))
                 except Exception:
                     pass
 
+            # —— 新增：多尺度参考匹配（等效核尺度） ——
+            if ms_enable and ms_kernels:
+                try:
+                    ms_out = _score_vs_scales(
+                        yh4, y4,
+                        kernel_sizes=ms_kernels,
+                        metrics=ms_metrics,
+                        metric_fns=METRIC_FNS,
+                        ref_mode=ms_ref_mode,
+                        upsample=ms_upsample,
+                        dump_curves=ms_dump_curv,
+                    )
+                    record.update(ms_out)
+                except Exception:
+                    # 防御式：即便失败也不影响其它评估
+                    pass
+
             layout_tag = _resolve_layout_tag_from_batch_or_dataset(batch, test_dl, layout_key)
             rec = {"p": p, "sigma": sigma, "layout_tag": layout_tag, **record}
 
-            # 逐样本选写（维持原样）
+            # —— 每样本分布（保留原有写法） ——
             if write_per_item:
-                # 仅为示例，保留原实现
                 per_item = {}
                 try:
-                    # l1/mse/psnr 的逐样本写法（原逻辑）
                     diff_l1 = (yh4 - y4).abs().mean(dim=list(range(1, yh4.ndim)))
                     diff_m2 = ((yh4 - y4) ** 2).mean(dim=list(range(1, yh4.ndim)))
                     per_item["l1"]  = [float(v) for v in diff_l1.detach().cpu().flatten()]
@@ -300,7 +326,6 @@ def _save_error_and_spectrum(
         plt.savefig(img_dir / f"{prefix}_rps.png", dpi=200)
         plt.close()
 
-# eval.py
 @torch.no_grad()
 def _relative_error_stats(
     pred4: torch.Tensor,
@@ -363,6 +388,155 @@ def _region_error_tiles(
         f"region_{tag}_max":  float(np.max(arr)),
         f"region_{tag}_mean": float(np.mean(arr)),
     }
+
+def _is_higher_better(metric_name: str) -> bool:
+    """
+    指标方向约定：
+    - 越大越好：psnr / ssim / corrcoef / vort_corr 等相关性与“质量高分”类
+    - 越小越好：l1 / mse / nmse / nmae / *mse / *mae / spectral_rrmse / ...
+    未知指标默认按“越小越好”处理（更保守）。
+    """
+    name = (metric_name or "").lower()
+    higher_good = {"psnr", "ssim", "corrcoef", "vort_corr"}
+    lower_good_prefix = ("l1", "mse", "nmse", "nmae", "grad_", "lap_", "tgrad_", "vort_m", "spectral_rrmse")
+    if name in higher_good:
+        return True
+    return not any(name.startswith(p) for p in higher_good) and not name in higher_good and not False \
+           if False else False  # 语义提示
+    # 上面写得有点绕，换成显式：
+    for p in lower_good_prefix:
+        if name.startswith(p):
+            return False
+    return False
+
+def _gaussian_kernel1d(ks: int, sigma: float = None, device=None, dtype=None) -> torch.Tensor:
+    """
+    生成 1D 高斯核（长度 ks，奇数）。sigma 若为空，用经验值 ks/6。
+    """
+    assert ks % 2 == 1 and ks >= 1
+    if sigma is None or sigma <= 0:
+        sigma = ks / 6.0
+    half = ks // 2
+    x = torch.arange(-half, half + 1, device=device, dtype=dtype)
+    w = torch.exp(-0.5 * (x / sigma) ** 2)
+    w = w / (w.sum() + 1e-12)
+    return w
+
+def _depthwise_gauss_blur2d(x4: torch.Tensor, ks: int, sigma: float = None) -> torch.Tensor:
+    """
+    对 x4=[B,C,H,W] 做深度可分离高斯模糊（不改变尺寸），不引入第三方库。
+    """
+    B, C, H, W = x4.shape
+    k1 = _gaussian_kernel1d(ks, sigma, device=x4.device, dtype=x4.dtype)
+    kx = k1.view(1, 1, 1, ks)
+    ky = k1.view(1, 1, ks, 1)
+    # 先水平、后垂直；使用 groups=C 的 depthwise conv
+    pad = ks // 2
+    w_x = kx.repeat(C, 1, 1, 1)
+    w_y = ky.repeat(C, 1, 1, 1)
+    out = F.conv2d(x4, w_x, padding=(0, pad), groups=C)
+    out = F.conv2d(out, w_y, padding=(pad, 0), groups=C)
+    return out
+
+def _apply_ref_view(y4: torch.Tensor, k: int, *, ref_mode: str = "gauss_down_up", upsample: str = "bicubic") -> torch.Tensor:
+    """
+    对 GT y4 施加指定尺度的“低通+下采样+上采样”（或仅低通），返回与原始同分辨率的参考视图。
+    - k: 核大小（奇数）
+    - ref_mode:
+        * "avgpool_up": 直接 avg_pool2d(kernel=k, stride=k) 下采样，再插值回原尺寸
+        * "gauss_down_up": 高斯平滑后按步长 k 下采样，再插值回原尺寸
+        * "blur_only": 仅做高斯平滑（不下采样、不上采样）
+    - upsample: F.interpolate 的模式
+    """
+    assert y4.ndim == 4, "expect [B,C,H,W]"
+    B, C, H, W = y4.shape
+    ref_mode = str(ref_mode or "gauss_down_up").lower()
+    up_mode = str(upsample or "bicubic").lower()
+    if k <= 1:
+        return y4
+
+    if ref_mode == "avgpool_up":
+        y_dn = F.avg_pool2d(y4, kernel_size=k, stride=k, ceil_mode=False)
+        y_up = F.interpolate(y_dn, size=(H, W), mode=up_mode, align_corners=False if "linear" in up_mode else None)
+        return y_up
+
+    if ref_mode == "gauss_down_up":
+        y_blur = _depthwise_gauss_blur2d(y4, ks=k)
+        y_dn = y_blur[:, :, ::k, ::k]  # 等价于 stride=k 的采样；更轻量
+        y_up = F.interpolate(y_dn, size=(H, W), mode=up_mode, align_corners=False if "linear" in up_mode else None)
+        return y_up
+
+    if ref_mode == "blur_only":
+        return _depthwise_gauss_blur2d(y4, ks=k)
+
+    # fallback
+    y_dn = F.avg_pool2d(y4, kernel_size=k, stride=k, ceil_mode=False)
+    y_up = F.interpolate(y_dn, size=(H, W), mode=up_mode, align_corners=False if "linear" in up_mode else None)
+    return y_up
+
+@torch.no_grad()
+def _score_vs_scales(
+    yhat4: torch.Tensor,
+    y4: torch.Tensor,
+    *,
+    kernel_sizes: List[int],
+    metrics: List[str],
+    metric_fns: Dict[str, Any],
+    ref_mode: str = "gauss_down_up",
+    upsample: str = "bicubic",
+    dump_curves: bool = False,
+) -> Dict[str, Any]:
+    """
+    针对若干核尺度 k∈kernel_sizes，构造参考视图 y^(k)，
+    计算各 metric(ŷ, y^(k))，返回：
+        - best_k_<metric>: 最优核
+        - at_best_<metric>: 最优 k 下的分数
+        - （可选）curves_<metric>: {k: score, ...}
+    """
+    assert yhat4.shape == y4.shape, "shape mismatch"
+    ks_list = [int(k) for k in kernel_sizes if int(k) >= 1 and int(k) % 2 == 1]
+    if not ks_list:
+        return {}
+    out: Dict[str, Any] = {}
+
+    # 预生成所有参考视图，避免重复平滑/采样
+    ref_by_k = {k: _apply_ref_view(y4, k, ref_mode=ref_mode, upsample=upsample) for k in ks_list}
+
+    for m in metrics:
+        fn = metric_fns.get(m, None)
+        if fn is None:
+            continue
+        vals = []
+        for k in ks_list:
+            try:
+                v = float(fn(yhat4, ref_by_k[k]).detach().cpu().item())
+            except Exception:
+                v = float("nan")
+            vals.append(v)
+
+        # 选择最优 k*
+        higher_better = _is_higher_better(m)
+        # 处理 NaN：替换为 -inf 或 +inf 以保证选择过程稳定
+        import math
+        safe_vals = []
+        for v in vals:
+            if math.isnan(v):
+                safe_vals.append((-1e30 if higher_better else 1e30))
+            else:
+                safe_vals.append(v)
+        if higher_better:
+            idx = int(max(range(len(safe_vals)), key=lambda i: safe_vals[i]))
+        else:
+            idx = int(min(range(len(safe_vals)), key=lambda i: safe_vals[i]))
+
+        best_k = ks_list[idx]
+        best_v = vals[idx]
+        out[f"best_k_{m}"] = int(best_k)
+        out[f"at_best_{m}"] = float(best_v)
+
+        if dump_curves:
+            out[f"curves_{m}"] = {int(k): float(v) for k, v in zip(ks_list, vals)}
+    return out
 
 @torch.no_grad()
 def render_eval_triplets(

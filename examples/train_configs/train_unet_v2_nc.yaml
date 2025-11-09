@@ -127,6 +127,14 @@ eval:
     tiles: [3, 3]
     use_nmse: true
 
+  multiscale_ref:
+    enable: true
+    kernel_sizes: [3,5,7,9,11]
+    ref_mode: gauss_down_up   # 或 avgpool_up
+    upsample: bicubic
+    metrics: []               # 为空则沿用 eval.metrics
+    dump_curves: false
+
   # 多尺度/频域保持兼容
   scales: { enable: false, levels: 3 }
   spectral: { enable: true, kbins: 32, fft_pad: true }
