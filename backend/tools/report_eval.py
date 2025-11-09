@@ -2,10 +2,106 @@
 from __future__ import annotations
 import argparse, csv, json
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Iterable, Any
 
 import numpy as np
 import matplotlib.pyplot as plt
+import os
+
+def run_report(
+    summary_dir: str | Path,
+    out_dir: Optional[str | Path] = None,
+    *,
+    metric_whitelist: Optional[Iterable[str]] = None,
+    patterns: Optional[Iterable[str]] = None,
+    overwrite: bool = False,
+    dpi: int = 220,
+    cmap: str = "RdBu_r",
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    在 ipynb / 脚本中一行运行全因子实验汇总报告，等价于命令行入口。
+    参数：
+      - summary_dir: 扫描 metrics_grid_*.csv 的目录（或包含子目录的根目录）
+      - out_dir: 报告输出目录；默认自动设为 summary_dir / 'report'
+      - metric_whitelist: 只处理这些指标名（如 ['psnr','nmse']）；默认 None = 全部发现到的指标
+      - patterns: 仅匹配含有这些子串的 csv 文件名；默认 None = 不限
+      - overwrite: True 时覆盖已有图/报告
+      - dpi, cmap: 绘图参数；cmap 统一默认 'RdBu_r'
+      - verbose: 打印进度
+
+    返回：
+      {
+        'summary_dir': <Path>,
+        'out_dir': <Path>,
+        'figures': { '<metric>': Path, ... },
+        'report_md': Path | None,
+        'scanned': [Path, ...]
+      }
+    """
+    sd = Path(summary_dir).expanduser().resolve()
+    if out_dir is None:
+        out_dir = sd / "report"
+    od = Path(out_dir).expanduser().resolve()
+    od.mkdir(parents=True, exist_ok=True)
+
+    # 扫描所有 metrics_grid_*.csv
+    all_csv: List[Path] = sorted(sd.rglob("metrics_grid_*.csv"))
+    if patterns:
+        pats = [str(p) for p in patterns]
+        all_csv = [p for p in all_csv if any(s in p.name for s in pats)]
+    if not all_csv and verbose:
+        print(f"[run_report] 未在 {sd} 下发现 metrics_grid_*.csv")
+
+    # 从文件名中推断 metric 名（约定：metrics_grid_<metric>.csv）
+    def _metric_from_name(p: Path) -> str:
+        name = p.stem  # metrics_grid_<metric>
+        return name.replace("metrics_grid_", "", 1)
+
+    # 白名单过滤
+    if metric_whitelist:
+        allow = set(metric_whitelist)
+        all_csv = [p for p in all_csv if _metric_from_name(p) in allow]
+
+    # 读取并绘图（调用你现有的绘图/报告函数）
+    figures: Dict[str, Path] = {}
+    scanned: List[Path] = []
+    for csv_path in all_csv:
+        metric = _metric_from_name(csv_path)
+        try:
+            P, S, M = _load_grid_csv(csv_path)  # 复用你现有的网格加载函数
+            title = f"{metric}"
+            fig_path = od / f"{metric}.png"
+
+            if (not fig_path.exists()) or overwrite:
+                _plot_heatmap(P, S, M, title, fig_path, cmap=cmap, dpi=dpi)  # 修改版见下节
+            figures[metric] = fig_path
+            scanned.append(csv_path)
+            if verbose:
+                print(f"[run_report] {metric} → {fig_path.name}")
+        except Exception as e:
+            if verbose:
+                print(f"[run_report] 跳过 {csv_path.name}: {e}")
+
+    # 生成 markdown 报告（若你原本就有 generate_report，可在其中复用）
+    report_md = od / "report.md"
+    if (not report_md.exists()) or overwrite:
+        try:
+            _write_markdown_report(report_md, figures)  # 见下节小工具
+            if verbose:
+                print(f"[run_report] 写入 {report_md.name}")
+        except Exception as e:
+            if verbose:
+                print(f"[run_report] 写入 report.md 失败: {e}")
+            report_md = None  # 容错
+
+    return {
+        "summary_dir": sd,
+        "out_dir": od,
+        "figures": figures,
+        "report_md": report_md,
+        "scanned": scanned,
+    }
 
 def _load_grid_csv(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -31,18 +127,30 @@ def _load_grid_csv(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     M = np.array(mat, dtype=float)  # shape [len(P), len(S)]
     return P, S, M
 
-def _plot_heatmap(P: np.ndarray, S: np.ndarray, M: np.ndarray, title: str, out_png: Path):
+def _plot_heatmap(P: np.ndarray, S: np.ndarray, M: np.ndarray, title: str, out_png: Path, cmap: str = "RdBu_r", dpi: int = 220):
     plt.figure()
-    # 注意：imshow 的 x->列、y->行；我们希望横轴 sigma，纵轴 p
-    plt.imshow(M, origin="lower", aspect="auto",
-               extent=[S.min(), S.max(), P.min(), P.max()])
+    plt.imshow(
+        M,
+        origin="lower",
+        aspect="auto",
+        extent=[S.min(), S.max(), P.min(), P.max()],
+        cmap=cmap,
+    )
     plt.xlabel("sigma")
     plt.ylabel("p (sample density)")
     plt.title(title)
     plt.colorbar()
     plt.tight_layout()
-    plt.savefig(out_png, dpi=220)
+    plt.savefig(out_png, dpi=dpi)
     plt.close()
+
+def _write_markdown_report(md_path: Path, figures: Dict[str, Path]) -> None:
+    lines = ["# Sweep Report\n"]
+    for metric, fig in sorted(figures.items()):
+        lines.append(f"## {metric}\n")
+        rel = fig.name
+        lines.append(f"![{metric}]({rel})\n")
+    md_path.write_text("\n".join(lines), encoding="utf-8")
 
 def generate_report(summary_dir: str, top_metrics: Optional[List[str]] = None) -> Dict[str, str]:
     """
@@ -73,7 +181,13 @@ def generate_report(summary_dir: str, top_metrics: Optional[List[str]] = None) -
         with np.errstate(invalid="ignore"):
             vmax = np.nanmax(M); vmin = np.nanmin(M)
             # 对于误差类指标（如 spectral_rrmse* / mse / grad_mse / lap_mse / vort_mse/mae），最佳是更小
-            err_like = any(metric.startswith(k) for k in ["spectral_rrmse", "mse", "grad_mse", "lap_mse", "vort_mse", "vort_mae"])
+            err_like = any(
+                metric.startswith(k) for k in [
+                    "spectral_rrmse", "mse", "grad_mse", "lap_mse",
+                    "vort_mse", "vort_mae",
+                    "nmse", "nmae", "rel_err", "region_"
+                ]
+            )
             best_val = vmin if err_like else vmax
             where = np.where(M == best_val)
         best_p = P[where[0][0]] if where[0].size else None
@@ -99,4 +213,25 @@ def _cli():
     print(json.dumps(out, indent=2))
 
 if __name__ == "__main__":
-    _cli()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--summary_dir", type=str, required=True)
+    parser.add_argument("--out_dir", type=str, default=None)
+    parser.add_argument("--metrics", type=str, nargs="*", default=None, help="metric 白名单，例如 psnr nmse")
+    parser.add_argument("--patterns", type=str, nargs="*", default=None, help="文件名包含这些子串才会被处理")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--dpi", type=int, default=220)
+    parser.add_argument("--cmap", type=str, default="RdBu_r")
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args()
+
+    run_report(
+        summary_dir=args.summary_dir,
+        out_dir=args.out_dir,
+        metric_whitelist=args.metrics,
+        patterns=args.patterns,
+        overwrite=args.overwrite,
+        dpi=args.dpi,
+        cmap=args.cmap,
+        verbose=not args.quiet,
+    )

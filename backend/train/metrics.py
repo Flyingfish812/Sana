@@ -195,3 +195,25 @@ def vort_corr(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> to
     den = (p.norm(dim=1) * t.norm(dim=1)) + eps
     r = num / den
     return r.mean()
+
+@torch.no_grad()
+def nmse(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    归一化 MSE: ||ŷ-y||₂² / (||y||₂² + eps)
+    返回 batch 平均标量。
+    """
+    pred = _as4d(pred); target = _as4d(target)
+    num = torch.sum((pred - target) ** 2, dim=list(range(1, pred.ndim)))
+    den = torch.sum(target ** 2, dim=list(range(1, target.ndim))) + eps
+    return (num / den).mean()
+
+@torch.no_grad()
+def nmae(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    归一化 MAE: ||ŷ-y||₁ / (||y||₁ + eps)
+    返回 batch 平均标量。
+    """
+    pred = _as4d(pred); target = _as4d(target)
+    num = torch.sum((pred - target).abs(), dim=list(range(1, pred.ndim)))
+    den = torch.sum(target.abs(), dim=list(range(1, target.ndim))) + eps
+    return (num / den).mean()

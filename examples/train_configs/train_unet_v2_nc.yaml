@@ -43,12 +43,12 @@ data:
   persistent_workers: true
   prefetch_factor: 4
   drop_last: false
-  save_dataloaders: true  # 开启后，这一轮也会把 dataloaders 存到自己的 run 目录
+  save_dataloaders: false
 
 # --------- Trainer 配置（Lightning）---------
 trainer:
   max_epochs: null
-  max_steps: 500
+  max_steps: 200
   precision: "bf16-mixed"           # 可选: "32" | "bf16-mixed"
   accelerator: "auto"
   devices: "auto"
@@ -101,11 +101,35 @@ callbacks:
     enable: true
     every_n_steps: 50
 
-# --------- 评估阶段（test + 离线评估&出图）---------
+# --------- 评估阶段（test + 离线评估&出图）---------  
 eval:
   enable: true
-  num_eval_batches: 3
+  metrics: [psnr, ssim, mse, nmse, nmae]   # 可与现有并行
+  num_eval_batches: 8
   num_plot_triplets: 6
+  write_per_item: false
+
+  # 可视化控制
+  eval_vis:
+    save_error_heatmap: false      # 避免和四联误差重复
+    spectrum_log_scale: true       # 频谱 y 轴 dB
+    spectrum_kbins: 64
+    cmap: RdBu_r
+
+  # 相对误差分位
+  rel_error:
+    enable: true
+    percentiles: [95, 99]
+
+  # 区域误差（按需开启）
+  region_error:
+    enable: true
+    tiles: [3, 3]
+    use_nmse: true
+
+  # 多尺度/频域保持兼容
+  scales: { enable: false, levels: 3 }
+  spectral: { enable: true, kbins: 32, fft_pad: true }
 
 # --------- 训练种子 ---------
 train:
