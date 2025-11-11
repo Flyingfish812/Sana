@@ -13,7 +13,7 @@ from .logging import build_loggers, prepare_run_dir
 from .callbacks import build_callbacks
 from .inspect import save_model_summary, dump_arch_spec
 from .utils import seed_everything
-from backend.eval import evaluate, render_eval_triplets
+from backend.eval import evaluate, render_eval_triplets, ensure_eval_multiscale_vis, append_multiscale_section
 from backend.model.epd_system import EPDSystem
 
 def build_model_from_cfg(model_cfg: Dict) -> EPDSystem:
@@ -153,6 +153,10 @@ def _run_single(
         model.eval()
         eval_vis = render_eval_triplets(model, test_dl, run_dir, eval_cfg)
         evaluate(model, test_dl, run_dir, eval_cfg)
+        ensure_eval_multiscale_vis(model, test_dl, run_dir, eval_cfg)
+        ms_vis = ((eval_cfg.get("multiscale_ref") or {}).get("vis") or {}) if isinstance(eval_cfg.get("multiscale_ref"), dict) else {}
+        ms_max = int(ms_vis.get("max_samples", 6))
+        append_multiscale_section(run_dir, max_samples=ms_max)
     else:
         eval_vis = run_dir / "eval_vis"
 
@@ -162,6 +166,7 @@ def _run_single(
         "config": str(run_dir / "config.dump.yaml"),
         "eval_log": str(run_dir / "eval_log.jsonl"),
         "eval_vis": str(eval_vis),
+        "eval_vis_ms": str(run_dir / "eval_vis_ms"),
     }
     return model, artefacts
 

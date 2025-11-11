@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -444,7 +444,6 @@ def _apply_ref_view(y4: torch.Tensor, k: int, *, ref_mode: str = "gauss_down_up"
     y_up = F.interpolate(y_dn, size=(H, W), mode=up_mode, align_corners=False if "linear" in up_mode else None)
     return y_up
 
-
 @torch.no_grad()
 def _score_vs_scales(
     yhat4: torch.Tensor,
@@ -502,6 +501,293 @@ def _score_vs_scales(
         if dump_curves:
             out[f"curves_{m}"] = {int(k): float(v) for k, v in zip(ks_list, vals)}
     return out
+
+def _try_plot_multiscale(
+    *,
+    out_dir: Path,
+    basename: str,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    yhat: torch.Tensor,
+    y_ref_by_k: Dict[int, torch.Tensor],
+    curves: Dict[str, Dict[int, float]] | None,
+    best_k_per_metric: Dict[str, int] | None,
+    strip_orientation: str = "row",
+    strip_path: Path | None = None,
+    curve_path: Path | None = None,
+    csv_path: Path | None = None,
+) -> None:
+    """
+    探测式调用绘图 + 可选 CSV 导出。
+    - strip_orientation: 传给 strip 联图的 row/col
+    - strip_path / curve_path：若为 None 则不保存
+    - csv_path：若非 None，则把 curves 写出 CSV（样本级）
+    """
+    try:
+        from backend.viz.images import save_multiscale_strip, save_metric_curves, save_curves_csv  # type: ignore
+    except Exception:
+        save_multiscale_strip = None
+        save_metric_curves = None
+        save_curves_csv = None
+
+    if strip_path is not None and save_multiscale_strip is not None:
+        try:
+            save_multiscale_strip(
+                x=x, y_hat=yhat, y=y, ref_by_k=y_ref_by_k,
+                save_path=strip_path, orientation=strip_orientation,
+            )
+        except Exception:
+            pass
+
+    if curves and curve_path is not None and save_metric_curves is not None:
+        try:
+            main_metric = next(iter(curves.keys()))
+        except Exception:
+            main_metric = None
+        try:
+            save_metric_curves(
+                curves=curves,
+                best_k_per_metric=best_k_per_metric or {},
+                save_path=curve_path,
+                main_metric=main_metric,
+            )
+        except Exception:
+            pass
+
+    if curves and csv_path is not None and save_curves_csv is not None:
+        try:
+            save_curves_csv(curves=curves, save_path=csv_path)
+        except Exception:
+            pass
+
+def _select_plot_curves(
+    curves: Dict[str, Dict[int, float]] | None,
+    plot_metrics_cfg: Optional[Sequence[str]],
+) -> Dict[str, Dict[int, float]] | None:
+    """
+    根据 vis.plot_metrics 选择要画在曲线图里的指标；
+    若未配置则全量返回；若 curves 为空返回 None。
+    """
+    if not curves:
+        return None
+    if not plot_metrics_cfg:
+        return curves
+    keep = {}
+    allow = set(plot_metrics_cfg)
+    for m, d in curves.items():
+        if m in allow:
+            keep[m] = d
+    if not keep:
+        # 防止用户给了错误的 metric 名称导致整图空白，回退到全量
+        return curves
+    return keep
+
+def ensure_eval_multiscale_vis(
+    model,
+    test_dl,
+    run_dir: Path,
+    cfg_eval: Dict[str, Any],
+) -> None:
+    """
+    安全触发多尺度可视化：若 multiscale_ref.enable 且 vis.enable，则执行；否则直接返回。
+    这样你只需在评估末尾加一行调用，不必改 evaluate(...) 的主体。
+    """
+    ms_cfg = cfg_eval.get("multiscale_ref", {}) or {}
+    if not bool(ms_cfg.get("enable", False)):
+        return
+    vis_cfg = (ms_cfg.get("vis") or {}) if isinstance(ms_cfg.get("vis"), dict) else {}
+    if not bool(vis_cfg.get("enable", True)):
+        return
+    try:
+        render_multiscale_panels(model, test_dl, run_dir, cfg_eval)
+    except Exception as e:
+        print(f"[multiscale-vis] skipped due to error: {e}")
+
+@torch.no_grad()
+def render_multiscale_panels(
+    model,
+    test_dl,
+    run_dir: Path,
+    cfg_eval: Dict[str, Any],
+) -> Path:
+    """
+    多尺度可视化的数据导出 + 可选即时绘图（strip/curve）。
+    本版（批次C）加入：
+      - vis 开关与数量控制（max_samples）、主曲线指标选择（plot_metrics）
+      - 条带方向（strip_orientation）
+      - 可选 CSV 导出（save_csv）
+      - 统一命名规范：strip_b{b}_i{n}.png / curve_b{b}_i{n}.png / curve_b{b}_i{n}.csv
+    """
+    if test_dl is None:
+        return run_dir / "eval_vis_ms"
+
+    # —— 读取配置 —— #
+    device = next(model.parameters()).device
+    model.eval(); model.to(device)
+
+    max_batches = int(cfg_eval.get("num_eval_batches", 3))
+    # 旧可视化上限（与三/四联图一致）；vis.max_samples 会进一步收紧
+    legacy_cap  = int(cfg_eval.get("num_plot_triplets", 4))
+
+    ms_cfg      = cfg_eval.get("multiscale_ref", {}) or {}
+    ms_enable   = bool(ms_cfg.get("enable", False))
+    if not ms_enable:
+        return ensure_dir(run_dir / "eval_vis_ms")
+
+    ks_list     = [int(k) for k in ms_cfg.get("kernel_sizes", [3,5,7,9,11]) if int(k) >= 1 and int(k) % 2 == 1]
+    if not ks_list:
+        return ensure_dir(run_dir / "eval_vis_ms")
+
+    ref_mode    = str(ms_cfg.get("ref_mode", "gauss_down_up"))
+    upsample    = str(ms_cfg.get("upsample", "bicubic"))
+    metric_names: List[str] = list(ms_cfg.get("metrics", [])) or list(cfg_eval.get("metrics", [])) or ["psnr"]
+    dump_curves = bool(ms_cfg.get("dump_curves", True))
+
+    # —— vis 子配置（本批次新增） —— #
+    vis_cfg          = (ms_cfg.get("vis") or {}) if isinstance(ms_cfg.get("vis"), dict) else {}
+    vis_enable       = bool(vis_cfg.get("enable", True))
+    vis_max_samples  = int(vis_cfg.get("max_samples", 6))
+    strip_orientation= str(vis_cfg.get("strip_orientation", "row"))
+    plot_metrics_cfg = vis_cfg.get("plot_metrics", None)
+    save_csv         = bool(vis_cfg.get("save_csv", True))
+
+    if not vis_enable:
+        return ensure_dir(run_dir / "eval_vis_ms")
+
+    # 最终数量上限：受 legacy_cap 与 vis_max_samples 共同约束
+    hard_cap = max(1, min(legacy_cap, vis_max_samples))
+
+    out_dir = ensure_dir(run_dir / "eval_vis_ms")
+
+    # —— 指标函数映射（与 evaluate 保持一致）—— #
+    METRIC_FNS = {
+        "l1": M.l1, "mse": M.mse, "psnr": M.psnr,
+        "corrcoef": M.corrcoef, "ssim": M.ssim,
+        "grad_mse": getattr(M, "grad_mse", None),
+        "lap_mse": getattr(M, "lap_mse", None),
+        "tgrad_mse": getattr(M, "tgrad_mse", None),
+        "vort_mse": getattr(M, "vort_mse", None),
+        "vort_mae": getattr(M, "vort_mae", None),
+        "vort_corr": getattr(M, "vort_corr", None),
+        "nmse": getattr(M, "nmse", None),
+        "nmae": getattr(M, "nmae", None),
+    }
+
+    def _metric_dir(name: str) -> bool:
+        # True=↑好；False=↓好
+        return _is_higher_better(name)
+
+    # —— 遍历采样 —— #
+    plotted, batches = 0, 0
+    for batch in test_dl:
+        if batches >= max_batches or plotted >= hard_cap:
+            break
+
+        batch = move_batch_to_device(batch, device)
+        x, y, _ = extract_xy(batch)
+        y_hat = model(ensure_5d(x))
+
+        # 统一 4D
+        y4  = y.squeeze(2)    if y.ndim == 5     else y
+        yh4 = y_hat.squeeze(2) if y_hat.ndim == 5 else y_hat
+        x4  = x if x.ndim == 4 else x[:, :, 0]
+
+        # 当批次样本数超过剩余额度时裁剪
+        take = min(x4.shape[0], hard_cap - plotted)
+        for idx in range(take):
+            # —— 构造多尺度参考 —— #
+            y_ref_by_k = {k: _apply_ref_view(y4[idx:idx+1], k, ref_mode=ref_mode, upsample=upsample) for k in ks_list}
+
+            # —— 逐尺度曲线 —— #
+            curves: Dict[str, Dict[int, float]] = {}
+            best_k_per_metric: Dict[str, int] = {}
+            best_v_per_metric: Dict[str, float] = {}
+
+            for m in metric_names:
+                fn = METRIC_FNS.get(m, None)
+                if fn is None:
+                    continue
+                vals = []
+                for k in ks_list:
+                    try:
+                        v = float(fn(yh4[idx:idx+1], y_ref_by_k[k]).detach().cpu().item())
+                    except Exception:
+                        v = float("nan")
+                    vals.append(v)
+
+                # best k
+                import math
+                higher = _metric_dir(m)
+                safe_vals = []
+                for v in vals:
+                    if math.isnan(v):
+                        safe_vals.append((-1e30 if higher else 1e30))
+                    else:
+                        safe_vals.append(v)
+                ii = int(max(range(len(safe_vals)), key=lambda i: safe_vals[i])) if higher \
+                     else int(min(range(len(safe_vals)), key=lambda i: safe_vals[i]))
+
+                best_k_per_metric[m] = ks_list[ii]
+                best_v_per_metric[m] = vals[ii]
+
+                if dump_curves:
+                    curves[m] = {int(k): float(v) for k, v in zip(ks_list, vals)}
+
+            # —— 输出命名（统一规范） —— #
+            bname = f"b{batches}_i{idx}"
+            npz_path   = out_dir / f"msdata_{bname}.npz"
+            json_path  = out_dir / f"mscurves_{bname}.json"
+            strip_path = out_dir / f"strip_{bname}.png"
+            curve_path = out_dir / f"curve_{bname}.png"
+            csv_path   = out_dir / f"curve_{bname}.csv"
+
+            # 保存张量数据（单样本）
+            save_dict = {
+                "x":    x4[idx:idx+1].detach().cpu().numpy(),
+                "y":    y4[idx:idx+1].detach().cpu().numpy(),
+                "yhat": yh4[idx:idx+1].detach().cpu().numpy(),
+            }
+            for k, ref in y_ref_by_k.items():
+                save_dict[f"y_ref_k{k}"] = ref.detach().cpu().numpy()
+            try:
+                import numpy as _np
+                _np.savez_compressed(npz_path, **save_dict)
+            except Exception:
+                import numpy as _np
+                _np.savez(npz_path, **save_dict)
+
+            # 保存元信息/曲线
+            meta = {
+                "kernel_sizes": ks_list,
+                "ref_mode": ref_mode,
+                "upsample": upsample,
+                "metrics": metric_names,
+                "best_k": best_k_per_metric,
+                "at_best": best_v_per_metric,
+            }
+            if dump_curves and curves:
+                meta["curves"] = curves
+            json_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            # —— 即时绘图（若可用） —— #
+            _try_plot_multiscale(
+                out_dir=out_dir,
+                basename=bname,
+                x=x4[idx:idx+1], y=y4[idx:idx+1], yhat=yh4[idx:idx+1],
+                y_ref_by_k=y_ref_by_k,
+                curves=_select_plot_curves(curves, plot_metrics_cfg),
+                best_k_per_metric={k: v for k, v in best_k_per_metric.items()
+                                   if (plot_metrics_cfg is None or k in set(plot_metrics_cfg))},
+                strip_orientation=strip_orientation,
+                strip_path=strip_path,
+                curve_path=curve_path,
+                csv_path=csv_path if save_csv else None,
+            )
+
+            plotted += 1
+        batches += 1
+
+    return out_dir
 
 @torch.no_grad()
 def render_eval_triplets(

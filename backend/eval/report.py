@@ -7,6 +7,7 @@ import numpy as np
 from .io import load_sweep_records, read_eval_metric_mean, read_eval_available_keys
 from .metrics import metric_specs, summarize_metric_grid
 from .visuals import plot_heatmap
+from .pdfprint import export_report_pdf
 
 def _build_metric_grids_from_records(
     records: List[dict],
@@ -133,8 +134,8 @@ def _write_markdown_report_ex(report_md: Path,
         lines.append(f"> {extra_notes}\n")
 
     lines.append("## 概览（一眼看懂）\n")
-    lines.append("| 指标 | 全称 | 方向 | 最佳值 | 位置(p, σ) | 覆盖率 | 评分 |\n")
-    lines.append("|---|---|:--:|---:|:--:|:--:|--:|\n")
+    lines.append("| 指标 | 全称 | 方向 | 最佳值 | 位置(p, σ) | 覆盖率 | 评分 |")
+    lines.append("|---|---|:--:|---:|:--:|:--:|--:|")
 
     metric_order = sorted(figures.keys())
     for m in metric_order:
@@ -148,7 +149,7 @@ def _write_markdown_report_ex(report_md: Path,
         score = f"{summ['score']:.1f}"
         best_val = "—" if summ["best_val"] is None else f"{summ['best_val']:.6g}"
         pos = "—" if summ["best_p"] is None else f"({summ['best_p']:.3f}, {summ['best_s']:.3f})"
-        lines.append(f"| `{m}` | {sp['fullname']} | {arrow} | {best_val} | {pos} | {cov} | {score} |\n")
+        lines.append(f"| `{m}` | {sp['fullname']} | {arrow} | {best_val} | {pos} | {cov} | {score} |")
 
     lines.append("\n> 说明：评分基于该指标在本次 sweep 的分布做分位归一（5%–95%），按“方向”将数值映射到0–100的相对量。")
     lines.append(" 对于 `best_k_*`，我们将“更小的核＝更细的可复原尺度”视作更优，因此按“↓好”处理。\n")
@@ -180,7 +181,7 @@ def _write_markdown_report_ex(report_md: Path,
             hint = "该图为在最优尺度 k* 下的分数，方向同基础指标。"
         else:
             hint = "暖色=好（↑）或冷色=好（↓），见概览表方向。"
-        lines.append(f"### `{m}`\n![]({fig.name})\n\n*解读提示*：{hint}\n")
+        lines.append(f"### `{m}`\n![](./{fig.name})\n\n*解读提示*：{hint}\n")
 
     if extra_notes:
         lines.append("\n---\n")
@@ -199,7 +200,13 @@ def run_report(
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
-    一行式/CLI 共享入口。签名与旧版一致。
+    报告流水线主入口：
+      1) 读取 sweep_summary 与各组 eval_log，汇总出网格并绘制热力图到 out_dir
+      2) 生成 out_dir/report.md
+      3) 若 out_dir 或 summary_dir 下存在 eval_vis_ms/*，则把“多尺度样例”附加到 report.md 末尾
+      4) 最后导出 out_dir/report.pdf  （在 md 生成完成后执行）
+
+    注意：这里的 out_dir 是“汇总报告”目录；单次 run 的报告若也需要相同流程，可在单 run 目录复用本函数。
     """
     sd = Path(summary_dir).expanduser().resolve()
     records = load_sweep_records(sd)
@@ -244,6 +251,18 @@ def run_report(
         if verbose:
             print(f"[run_report] 写入 {report_md.name}")
 
+    # —— 在生成 report.md 之后，若存在多尺度可视化产物，则把样例附加到报告末尾 —— #
+    # 兼容两种位置：优先 out_dir/eval_vis_ms，其次 summary_dir/eval_vis_ms
+    ms_dir_candidates = [od / "eval_vis_ms", sd / "eval_vis_ms"]
+    ms_dir = next((p for p in ms_dir_candidates if p.exists() and any(p.glob("strip_*.png"))), None)
+    if ms_dir is not None:
+        # 从配置推一个展示上限；找不到配置就取 6
+        # 这里是汇总报告流程，可能拿不到 eval 配置；用默认 6 更稳妥
+        ms_max = 6
+        append_multiscale_section(od, max_samples=ms_max)
+        if verbose:
+            print(f"[run_report] 附加多尺度样例：{ms_dir}")
+
     return {
         "run_root": sd,
         "out_dir": od,
@@ -253,3 +272,75 @@ def run_report(
         "P": P.tolist(),
         "S": S.tolist(),
     }
+
+def _iter_ms_pairs(ms_dir: Path) -> List[Tuple[Optional[Path], Optional[Path]]]:
+    """
+    容错版：允许只有 strip 或只有 curve。
+    返回 (strip_png或None, curve_png或None) 的配对，按基名排序。
+    """
+    if not ms_dir.exists():
+        return []
+    strips = {p.stem.replace("strip_", ""): p for p in sorted(ms_dir.glob("strip_*.png"))}
+    curves = {p.stem.replace("curve_", ""): p for p in sorted(ms_dir.glob("curve_*.png"))}
+    keys = sorted(set(strips.keys()) | set(curves.keys()))
+    pairs: List[Tuple[Optional[Path], Optional[Path]]] = []
+    for k in keys:
+        pairs.append((strips.get(k), curves.get(k)))
+    return pairs
+
+def append_multiscale_section(
+    run_dir: Path,
+    *,
+    section_title: str = "多尺度样例（内部判定可视化）",
+    max_samples: int = 6,
+    rel_base: Optional[Path] = None,
+) -> Path:
+    """
+    在 run_dir/report.md 的末尾追加“多尺度样例”一节，将 eval_vis_ms/ 下
+    的 strip_*.png 与 curve_*.png 成对插入，便于审阅 best_k 的判定过程。
+
+    - max_samples: 最多放入多少对样例（默认 6）
+    - rel_base: 渲染到 md 的相对基准路径；缺省则以 report.md 所在目录为基准
+    返回最终写入的 report.md 路径。
+    """
+    run_dir = Path(run_dir)
+    report_md = run_dir / "report.md"
+    ms_dir = run_dir / "eval_vis_ms"
+
+    pairs = _iter_ms_pairs(ms_dir)
+    if not pairs:
+        # 没有可用的多尺度可视化，直接返回
+        return report_md
+
+    # 组装 Markdown 片段
+    lines = []
+    lines.append("\n---\n")
+    lines.append(f"## {section_title}\n")
+    lines.append("> 本节展示模型输出与不同尺度参考(target@k)的**联图**与**指标曲线**，便于核对 `best_k` 的来源。\n")
+    lines.append("> 左图为条带联图（共享色标，零居中），右图为主指标曲线并高亮最优尺度。\n\n")
+
+    # 相对路径计算（便于 md 在不同位置渲染）
+    if rel_base is None:
+        rel_base = report_md.parent
+
+    used = 0
+    for strip_png, curve_png in pairs:
+        if used >= max_samples:
+            break
+        strip_rel = strip_png.relative_to(rel_base)
+        curve_rel = curve_png.relative_to(rel_base)
+
+        # 并排布局：用一个两列表格简单并排
+        lines.append("| 多尺度联图 | 指标曲线 |\n")
+        lines.append("|:--:|:--:|\n")
+        lines.append(f"| ![]({strip_rel.as_posix()}) | ![]({curve_rel.as_posix()}) |\n\n")
+
+        used += 1
+
+    # 若 report.md 不存在则创建；存在则在末尾追加
+    report_md.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if report_md.exists() else "w"
+    with report_md.open(mode=mode, encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    return report_md

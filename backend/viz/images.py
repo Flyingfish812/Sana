@@ -188,3 +188,200 @@ def save_quadruple_grid(
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return True
+
+def save_multiscale_strip(
+    *,
+    x: torch.Tensor | np.ndarray,
+    y_hat: torch.Tensor | np.ndarray,
+    y: torch.Tensor | np.ndarray,
+    ref_by_k: dict[int, torch.Tensor | np.ndarray],
+    save_path: str | Path,
+    title: str | None = None,
+    orientation: str = "row",  # 兼容旧签名；本版固定每行最多2张，忽略该参数
+    cmap: str = "RdBu_r",
+) -> bool:
+    """
+    多尺度联图：按“每行最多2张”的网格排布，而非单行铺满。
+    面板顺序：Input | Output | Target | Target@k1 | Target@k2 | ...
+    - 所有面板共享同一色标（TwoSlopeNorm，center=0）
+    - 底部单独放置横向 colorbar，不挤压图像区域
+    """
+    if plt is None:
+        return False
+
+    # —— 收集面板与标签 —— #
+    panels: list[np.ndarray] = []
+    labels: list[str] = []
+
+    x_img    = _to_hw(x, ch=0)          # Input 画第0通道
+    yhat_img = _to_hw(y_hat, ch=None)   # 单通道自动去[C]
+    y_img    = _to_hw(y, ch=None)
+
+    panels.extend([x_img, yhat_img, y_img])
+    labels.extend(["Input", "Output", "Target"])
+
+    ks_sorted = sorted(list(ref_by_k.keys()))
+    for k in ks_sorted:
+        panels.append(_to_hw(ref_by_k[k], ch=None))
+        labels.append(f"Target@k={k}")
+
+    n = len(panels)
+    if n == 0:
+        return False
+
+    # —— 共享色标（零居中） —— #
+    arr_all = np.stack(panels, axis=0)
+    vmin = float(np.nanmin(arr_all))
+    vmax = float(np.nanmax(arr_all))
+    if np.isclose(vmin, vmax):
+        vmax = vmin + 1.0
+    norm = TwoSlopeNorm(vcenter=0.0, vmin=vmin, vmax=vmax)
+
+    # —— 布局：每行最多2张，多余换行；最下一行给 colorbar —— #
+    import math
+    ncols = 2
+    nrows = math.ceil(n / ncols)
+
+    # 估算画布尺寸：行列越多，尺寸相应放大一些
+    fig_w = max(8.0, 5.0 * ncols)           # 每列 ~5英寸
+    fig_h = max(3.0, 3.8 * nrows) + 0.8     # 预留0.8给colorbar
+    fig = plt.figure(figsize=(fig_w, fig_h), constrained_layout=False)
+
+    import matplotlib.gridspec as gridspec
+    gs = gridspec.GridSpec(
+        nrows=nrows + 1, ncols=ncols,
+        height_ratios=[*(1 for _ in range(nrows)), 0.10],
+        hspace=0.12, wspace=0.08
+    )
+
+    axes = []
+    for i in range(n):
+        r = i // ncols
+        c = i % ncols
+        axes.append(fig.add_subplot(gs[r, c]))
+
+    # —— 逐格绘制 —— #
+    im_first = None
+    for ax, img, lab in zip(axes, panels, labels):
+        im = ax.imshow(img, cmap=cmap, norm=norm)
+        if im_first is None:
+            im_first = im
+        ax.set_title(lab, fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.axis("off")
+
+    if title:
+        fig.suptitle(title, y=0.995, fontsize=11)
+
+    # —— colorbar 独占最后一行，跨越所有列 —— #
+    cax = fig.add_subplot(gs[-1, :])
+    cbar = fig.colorbar(im_first, cax=cax, orientation="horizontal")
+    cbar.set_label("Field value (shared, centered at 0)", fontsize=9)
+
+    out = Path(save_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+def save_metric_curves(
+    *,
+    curves: dict[str, dict[int, float]],
+    best_k_per_metric: dict[str, int] | None,
+    save_path: str | Path,
+    main_metric: str | None = None,
+    max_extras: int = 2,
+) -> bool:
+    """
+    生成“多尺度指标曲线图”：
+    - curves: {metric_name: {k: value}}
+    - best_k_per_metric: {metric_name: k*}，用于高亮竖带与标注
+    - main_metric: 主展示指标（大图）；其余指标作为 small multiples（最多 max_extras 个）
+    """
+    if plt is None:
+        return False
+
+    if not curves:
+        return False
+
+    # —— 选择主指标与附加指标 —— #
+    metric_names = list(curves.keys())
+    if main_metric is None or main_metric not in metric_names:
+        main_metric = metric_names[0]
+    extras = [m for m in metric_names if m != main_metric][:max_extras]
+
+    # —— ks 轴（统一为并集的升序）——
+    ks_all = sorted({k for m in metric_names for k in curves[m].keys()})
+
+    # —— 版式：1 行主图 + 若干行小图 —— #
+    nrows = 1 + (len(extras) if extras else 0)
+    fig_h = 2.6 * nrows
+    fig_w = 7.5
+    fig, axes = plt.subplots(nrows=nrows, ncols=1, figsize=(fig_w, fig_h), squeeze=False)
+    axes = axes[:, 0].tolist()
+
+    def _plot_one(ax, metric: str):
+        # y 序列：按 ks_all 对齐
+        ys = [curves[metric].get(k, np.nan) for k in ks_all]
+        ax.plot(ks_all, ys, marker="o", linewidth=1.8)
+        ax.set_xlabel("kernel size k")
+        ax.set_ylabel(metric)
+        ax.grid(True, alpha=0.35, linestyle="--", linewidth=0.6)
+
+        # 高亮 best_k
+        k_star = None if best_k_per_metric is None else best_k_per_metric.get(metric)
+        if k_star is not None:
+            # 竖直带 + 标注
+            ax.axvspan(k_star - 0.5, k_star + 0.5, alpha=0.15)
+            # 在该点附近加一个更醒目的 marker/文本
+            try:
+                y_star = curves[metric][k_star]
+                ax.plot([k_star], [y_star], marker="o", markersize=8)
+                ax.text(k_star, y_star, f"  best k={k_star}\n  {metric}={y_star:.4g}",
+                        fontsize=9, va="bottom", ha="left")
+            except Exception:
+                pass
+
+        # x 轴刻度标注成整数 k
+        ax.set_xticks(ks_all)
+
+    # —— 绘制主图 —— #
+    _plot_one(axes[0], main_metric)
+    axes[0].set_title(f"Multi-scale metric curves — main: {main_metric}", fontsize=11)
+
+    # —— 小 multiples —— #
+    for i, m in enumerate(extras, start=1):
+        _plot_one(axes[i], m)
+        axes[i].set_title(f"{m}", fontsize=10)
+
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+def save_curves_csv(
+    *,
+    curves: dict[str, dict[int, float]],
+    save_path: str | Path,
+) -> bool:
+    """
+    将样本级的 {metric: {k: value}} 写成 tidy CSV：
+        metric,k,value
+        psnr,3,XX
+        psnr,5,XX
+        ...
+    """
+    try:
+        import csv
+        p = Path(save_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["metric", "k", "value"])
+            for m, kv in curves.items():
+                for k in sorted(kv.keys()):
+                    writer.writerow([m, int(k), float(kv[k])])
+        return True
+    except Exception:
+        return False
