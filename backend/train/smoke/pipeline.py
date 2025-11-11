@@ -12,9 +12,9 @@ import yaml
 from backend.common import ensure_dir, move_batch_to_device
 
 from backend.model.epd_system import EPDSystem
-from ..data_adapter import build_dataloaders
-from ..inspect import save_model_summary
-from ..eval import evaluate, render_eval_triplets
+from backend.train.data_adapter import build_dataloaders
+from backend.train.inspect import save_model_summary
+from backend.eval import evaluate, render_eval_triplets
 
 
 def _select_device(device: str) -> torch.device:

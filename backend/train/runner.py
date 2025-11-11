@@ -12,8 +12,8 @@ from .data_adapter import build_dataloaders, maybe_save_dataloaders
 from .logging import build_loggers, prepare_run_dir
 from .callbacks import build_callbacks
 from .inspect import save_model_summary, dump_arch_spec
-from .eval import evaluate, render_eval_triplets
 from .utils import seed_everything
+from backend.eval import evaluate, render_eval_triplets
 from backend.model.epd_system import EPDSystem
 
 def build_model_from_cfg(model_cfg: Dict) -> EPDSystem:
