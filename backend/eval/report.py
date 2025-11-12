@@ -149,7 +149,7 @@ def _write_markdown_report_ex(report_md: Path,
         score = f"{summ['score']:.1f}"
         best_val = "—" if summ["best_val"] is None else f"{summ['best_val']:.6g}"
         pos = "—" if summ["best_p"] is None else f"({summ['best_p']:.3f}, {summ['best_s']:.3f})"
-        lines.append(f"| `{m}` | {sp['fullname']} | {arrow} | {best_val} | {pos} | {cov} | {score} |")
+        lines.append(f"| {m} | {sp['fullname']} | {arrow} | {best_val} | {pos} | {cov} | {score} |")
 
     lines.append("\n> 说明：评分基于该指标在本次 sweep 的分布做分位归一（5%–95%），按“方向”将数值映射到0–100的相对量。")
     lines.append(" 对于 `best_k_*`，我们将“更小的核＝更细的可复原尺度”视作更优，因此按“↓好”处理。\n")

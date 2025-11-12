@@ -221,6 +221,7 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
 
             fp.write(json.dumps(rec) + "\n")
             fp.flush()
+    ensure_eval_multiscale_vis(model, test_dl, run_dir, cfg_eval)
 
 def _resolve_layout_tag_from_batch_or_dataset(batch, test_dl, layout_key: str = "layout_tag"):
     tag = None

@@ -15,7 +15,7 @@ REGISTRY_TYPES = {
     "head": HEAD_REGISTRY,
 }
 
-# >>> 新增：内置组件模块清单（至少把最小可跑的那几个放进来）
+# 内置组件模块清单（至少把最小可跑的那几个放进来）
 _BUILTIN_MODULES = [
     "backend.model.encoders.unet_base",
     "backend.model.encoders.vit",
@@ -24,6 +24,9 @@ _BUILTIN_MODULES = [
     "backend.model.decoders.unet_decoder",
     "backend.model.decoders.vit",
     "backend.model.heads.pixel_head",
+    "backend.model.encoders.voronoicnn",
+    "backend.model.decoders.identity",
+    "backend.model.heads.voronoihead",
 ]
 _BUILTINS_LOADED = False
 
