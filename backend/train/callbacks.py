@@ -15,40 +15,88 @@ class TripletVizCallback(pl.Callback):
         self.num_triplets = num_triplets
 
     def on_train_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, outputs, batch, batch_idx: int):
-        if self.every_n_steps <= 0: return
+        if self.every_n_steps <= 0:
+            return
         gstep = trainer.global_step or 0
-        if gstep % self.every_n_steps != 0: return
+        if gstep % self.every_n_steps != 0:
+            return
         try:
-            # 取一小片做推理
-            x, y = None, None
+            import torch
+            import torchvision.utils as vutils
+
+            # 取 batch 中的 x,y
             if isinstance(batch, (tuple, list)):
                 x, y = batch[0], batch[1]
             elif isinstance(batch, dict):
+                from .utils import pick_first_key
                 x = pick_first_key(batch, ("x", "input", "inputs", "image"))
                 y = pick_first_key(batch, ("y", "target", "targets", "label"))
             else:
                 return
             if x is None or y is None:
                 return
-            if x.ndim == 4: x5 = x[:1].unsqueeze(2)
-            else: x5 = x[:1]
+
+            # 统一到 [N,C,H,W]；并单样本
+            if x.ndim == 5:  # [N,C,T,H,W]
+                x_vis = x[:1, :, 0]  # 取 T=0
+            else:
+                x_vis = x[:1]
+            if y.ndim == 5:
+                y_vis = y[:1, :, 0]
+            else:
+                y_vis = y[:1]
+
+            # 推理
             pl_module.eval()
             with torch.no_grad():
+                x5 = x[:1] if x.ndim == 5 else x[:1].unsqueeze(2)  # 保证 [1,C,T,H,W]
                 yhat = pl_module(x5).squeeze(2)  # [1,C,H,W]
-            import torchvision.utils as vutils
-            import torch
-            # 拼一行三图（normalize 以便写板）
-            grid = vutils.make_grid([
-                (x[:1] if x.ndim==4 else x[:1, :, 0]).float(),      # Input
-                yhat[:1].float(),                                   # Output
-                (y[:1] if y.ndim==4 else y[:1, :, 0]).float(),      # Target
-            ], nrow=3, normalize=True)
+
+            # 通道名（若上游写入了）
+            in_names = []
+            out_names = []
+            try:
+                ds_meta = getattr(trainer.datamodule, "meta", None)  # 常规 Lightning DataModule 不一定有
+            except Exception:
+                ds_meta = None
+            # 更稳：从当前 loader 的 dataset 读
+            try:
+                cur_loader = trainer.fit_loop._combined_loader._loader
+                ds = getattr(cur_loader, "dataset", None)
+                meta = getattr(ds, "meta", {}) if ds is not None else {}
+                ch = meta.get("channel_names", {})
+                in_names = list(ch.get("in_names", []))
+                out_names = list(ch.get("out_names", []))
+            except Exception:
+                pass
+
+            C_in = int(x_vis.shape[1])
+            C_out = int(y_vis.shape[1])
+            K_in = min(3, C_in)
+            K_out = min(3, C_out)
+
+            # 只取前 K 个通道拼网格（避免高维爆图）
+            tiles = []
+            tiles.append(x_vis[:, :K_in])           # 输入前 K_in
+            tiles.append(yhat[:, :K_out])           # 预测前 K_out
+            tiles.append(y_vis[:, :K_out])          # 目标前 K_out
+
+            grid = vutils.make_grid(
+                torch.cat(tiles, dim=0),  # [3*K,1,H,W] 或 [3*K,C?,H,W]（make_grid会按通道处理）
+                nrow=max(K_in, K_out),
+                normalize=True
+            )
+
+            tag = "triplet/sample"
+            if out_names and len(out_names) >= K_out:
+                tag = f"triplet/{'+'.join(out_names[:K_out])}"
+
             logger = trainer.logger
             if hasattr(logger, "experiment"):
-                logger.experiment.add_image("triplet/sample", grid, global_step=gstep)
-        except Exception:
-            pass  # 忽略可视化失败，不影响训练
-
+                logger.experiment.add_image(tag, grid, global_step=gstep)
+        except Exception as e:
+            print("TripletVizCallback 出图失败：", e)
+            pass
 
 def build_callbacks(cb_cfg: Dict[str, Any], root_cfg: Dict, run_dir: Path) -> List[pl.Callback]:
     cbs: List[pl.Callback] = []

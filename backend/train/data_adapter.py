@@ -43,9 +43,10 @@ def _with_loader_opts(dl: DataLoader, cfg: Dict) -> DataLoader:
 def _build_via_builder(builder: str, builder_args: Dict, data_cfg: Dict) -> Tuple[DataLoader, Optional[DataLoader], DataLoader]:
     """
     通过 builder 构建 dataloaders。
-    在此处把 config.data.factors 与常用的 DataLoader 选项合并进入 builder_args。
+    在此处把 config.data.factors、io、legacy_three_channel_input 等
+    合并进入 builder_args，以便 builder 能正确组装通道。
     """
-    # 1) 合并 factors
+    # 1) 合并 factors（采样密度 / 噪声 / 随机种）
     factors = (data_cfg or {}).get("factors", {}) or {}
     ba = dict(builder_args or {})
     if factors.get("sample_density") is not None:
@@ -55,19 +56,31 @@ def _build_via_builder(builder: str, builder_args: Dict, data_cfg: Dict) -> Tupl
     if factors.get("rng_seed_offset") is not None:
         ba["rng_seed_offset"] = int(factors["rng_seed_offset"])
 
-    # 2) 合并常用 DataLoader 选项（保持与 snapshot_dir 分支一致）
-    for k in ("batch_size", "num_workers", "pin_memory", "persistent_workers",
-              "prefetch_factor", "drop_last", "shuffle", "split"):
-        if k in (data_cfg or {}):
+    # 2) 合并 io / 兼容开关 / base_channel 等通道相关配置
+    if "io" in (data_cfg or {}):
+        ba["io"] = dict(data_cfg["io"])  # predict_channels / extras 等
+    if "legacy_three_channel_input" in (data_cfg or {}):
+        ba["legacy_three_channel_input"] = bool(data_cfg["legacy_three_channel_input"])
+    if "base_channel" in (data_cfg or {}):
+        ba["base_channel"] = str(data_cfg["base_channel"])
+
+    # 3) 合并 DataLoader 常用选项（若 builder 直接消费）
+    for k in ("batch_size", "num_workers", "pin_memory", "persistent_workers", "prefetch_factor", "drop_last", "shuffle", "split"):
+        if k in (data_cfg or {}) and (data_cfg[k] is not None):
             ba[k] = data_cfg[k]
 
-    # 3) 动态导入并调用
-    module, fn = builder.split(":")
-    func = getattr(import_module(module), fn)
-    out = func(**ba)
-    if isinstance(out, dict):
-        return out.get("train"), out.get("val"), out.get("test")
-    return out
+    # 4) 解析 builder 并调用
+    if ":" in builder:
+        mod_name, fn_name = builder.split(":", 1)
+    else:
+        mod_name, fn_name = builder, "build_all"
+    mod = import_module(mod_name)
+    fn = getattr(mod, fn_name)
+
+    # 5) 调 builder（把合并后的 ba 作为 **kwargs 传入）
+    train_dl, val_dl, test_dl = fn(**ba)
+
+    return train_dl, val_dl, test_dl
 
 def _resolve_from_run_dir(run_dir: str | Path) -> Tuple[Optional[str], Optional[Tuple[DataLoader, Optional[DataLoader], DataLoader]]]:
     """

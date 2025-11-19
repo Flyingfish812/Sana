@@ -27,12 +27,18 @@ data:
   #   sample_density: 0.05
   #   noise_sigma: 0.01
   #   rng_seed_offset: 0
+  io:
+    task: reconstruct              # 先只做复原
+    predict_channels: ["u"]        # 只预测u（输出C_out=1）
+    extras:
+      point_mask: true             # 加位置通道P
+      point_value: true            # 加观测值×位置通道P_val
 
-  # 新增：全因子矩阵设定
+  # 全因子矩阵设定
   sweep:
     enable: true
     # p_list: [0.01, 0.03, 0.05, 0.07, 0.10]
-    p_list: [0.01, 0.05]
+    p_list: [0.001, 0.005]
     # sigma_list: [0.000, 0.005, 0.010, 0.020, 0.030]
     sigma_list: [0.000, 0.010]
     mode: grid

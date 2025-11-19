@@ -52,13 +52,17 @@ def _resolve_layout_tag(batch, layout_tag_key: str):
 def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
     """
     评估模型，写入 run_dir/eval_log.jsonl
-    - 相对误差：nmse/nmae、分位数
-    - 区域误差：region_nmse_max/mean 或 region_nmae_max/mean
-    - 多尺度参考匹配：best_k_<metric> 与 at_best_<metric>
-    - 频域指标（若 S 可用）
+
+    新增：
+    - 逐通道指标：对 y 的每个通道分别计算 metrics，键名格式："{metric}/{ch_name}"
+      * ch_name 来源：test_dl.dataset.meta["channel_names"]["out_names"]；否则回退为 "c{i}"
+    - 总体指标仍保留为 "{metric}"（对所有通道整体/按C维聚合）
+    - 与原版一致：相对/区域误差、多尺度参考匹配、频域指标、样本分布输出等
     """
     if test_dl is None:
         return
+
+    # --------- 配置与公共项 ---------
     log_path = run_dir / "eval_log.jsonl"
     device = next(model.parameters()).device
     limit = int(cfg_eval.get("num_eval_batches", 3))
@@ -68,13 +72,18 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
     sigma = factors.get("noise_sigma", None) if isinstance(factors, dict) else None
 
     metric_names: List[str] = list(cfg_eval.get("metrics", []))
-    use_scales = bool(cfg_eval.get("scales", {}).get("enable", False))
-    n_levels   = int(cfg_eval.get("scales", {}).get("levels", 3))
+    use_scales   = bool(cfg_eval.get("scales", {}).get("enable", False))
+    n_levels     = int(cfg_eval.get("scales", {}).get("levels", 3))
     use_spectral = bool(cfg_eval.get("spectral", {}).get("enable", False))
-    kbins      = int(cfg_eval.get("spectral", {}).get("kbins", 32))
-    fft_pad    = bool(cfg_eval.get("spectral", {}).get("fft_pad", True))
-    layout_key = cfg_eval.get("layout_tag_key", "layout_tag")
+    kbins        = int(cfg_eval.get("spectral", {}).get("kbins", 32))
+    fft_pad      = bool(cfg_eval.get("spectral", {}).get("fft_pad", True))
+    layout_key   = cfg_eval.get("layout_tag_key", "layout_tag")
     write_per_item = bool(cfg_eval.get("write_per_item", False))
+
+    # 逐通道输出控制
+    per_ch_cfg  = cfg_eval.get("per_channel", {}) or {}
+    per_ch_enable = bool(per_ch_cfg.get("enable", True))   # 默认开启
+    per_ch_metrics: Sequence[str] = list(per_ch_cfg.get("metrics", [])) or metric_names  # 可单独指定要逐通道统计的 metrics
 
     # 相对/区域误差
     rel_cfg   = cfg_eval.get("rel_error", {})
@@ -113,19 +122,42 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
         "nmae": getattr(M, "nmae", None),
     }
 
+    # --------- 工具：读取通道名（输出侧） ---------
+    def _get_out_channel_names(dl) -> List[str]:
+        names: List[str] = []
+        try:
+            ds = getattr(dl, "dataset", None)
+            meta = getattr(ds, "meta", None) if ds is not None else None
+            if isinstance(meta, dict):
+                ch = meta.get("channel_names") or {}
+                outs = ch.get("out_names")
+                if isinstance(outs, (list, tuple)):
+                    names = list(outs)
+        except Exception:
+            names = []
+        return names
+
+    out_names = _get_out_channel_names(test_dl)
+
     with log_path.open("a", encoding="utf-8") as fp:
         for bidx, batch in enumerate(test_dl):
             if bidx >= limit:
                 break
+
             batch = move_batch_to_device(batch, device)
             x, y, _ = extract_xy(batch)
             y_hat = model(ensure_5d(x))
 
+            # 统一成 4D [B,C,H,W]
             y4  = y.squeeze(2) if y.ndim == 5 else y
             yh4 = y_hat.squeeze(2) if y_hat.ndim == 5 else y_hat
 
+            B, C, H, W = yh4.shape
+
+            # 准备记录对象
             record: Dict[str, Any] = {}
-            # —— 基础指标 —— #
+
+            # —— 整体指标（沿用原逻辑）—— #
             for name in metric_names:
                 fn = METRIC_FNS.get(name, None)
                 if fn is None:
@@ -139,7 +171,32 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
                 except Exception:
                     pass
 
-            # —— 金字塔 —— #
+            # —— 逐通道指标（新增） —— #
+            if per_ch_enable and C >= 1:
+                # 通道名回退
+                if not out_names or len(out_names) != C:
+                    ch_names = [f"c{i}" for i in range(C)]
+                else:
+                    ch_names = list(out_names)
+
+                for ci in range(C):
+                    yi  = y4[:, ci:ci+1]   # 保持 [B,1,H,W]
+                    yhi = yh4[:, ci:ci+1]
+                    tag = ch_names[ci]
+                    for name in per_ch_metrics:
+                        fn = METRIC_FNS.get(name, None)
+                        if fn is None:
+                            continue
+                        try:
+                            if name == "tgrad_mse":
+                                # tgrad 需要 5D；逐通道退化到 4D 不合适，跳过或使用整体的 tgrad
+                                continue
+                            valc = float(fn(yhi, yi).detach().cpu().item())
+                            record[f"{name}/{tag}"] = valc
+                        except Exception:
+                            pass
+
+            # —— 金字塔（整体）—— #
             if use_scales and n_levels > 1:
                 pyr_pred = _build_pyramid(yh4, n_levels)
                 pyr_tgt  = _build_pyramid(y4,  n_levels)
@@ -153,7 +210,7 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
                         except Exception:
                             pass
 
-            # —— 频域 —— #
+            # —— 频域（整体）—— #
             if use_spectral and S is not None:
                 try:
                     spec = S.spectral_rrmse(yh4, y4, kbins=kbins, fft_pad=fft_pad)
@@ -165,7 +222,7 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
                 except Exception:
                     pass
 
-            # —— 相对/区域误差 —— #
+            # —— 相对/区域误差（整体）—— #
             if use_rel:
                 if "nmse" not in record and METRIC_FNS.get("nmse"):
                     try: record["nmse"] = float(METRIC_FNS["nmse"](yh4, y4).detach().cpu().item())
@@ -184,7 +241,7 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
                 except Exception:
                     pass
 
-            # —— 多尺度参考匹配 —— #
+            # —— 多尺度参考匹配（整体）—— #
             if ms_enable and ms_kernels:
                 try:
                     ms_out = _score_vs_scales(
@@ -203,7 +260,7 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
             layout_tag = _resolve_layout_tag_from_batch_or_dataset(batch, test_dl, layout_key)
             rec = {"p": p, "sigma": sigma, "layout_tag": layout_tag, **record}
 
-            # —— 每样本分布（可选） —— #
+            # —— 每样本分布（整体） —— #
             if write_per_item:
                 per_item = {}
                 try:
@@ -219,8 +276,11 @@ def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
                 if per_item:
                     rec["per_item"] = per_item
 
-            fp.write(json.dumps(rec) + "\n")
-            fp.flush()
+            with log_path.open("a", encoding="utf-8") as _fp:
+                _fp.write(json.dumps(rec) + "\n")
+                _fp.flush()
+
+    # 多尺度可视化依然在末尾触发（与原版一致）
     ensure_eval_multiscale_vis(model, test_dl, run_dir, cfg_eval)
 
 def _resolve_layout_tag_from_batch_or_dataset(batch, test_dl, layout_key: str = "layout_tag"):
@@ -236,79 +296,210 @@ def _resolve_layout_tag_from_batch_or_dataset(batch, test_dl, layout_key: str = 
 def _save_error_and_spectrum(
     img_dir: Path,
     prefix: str,
-    pred_4d: torch.Tensor,
-    gt_4d: torch.Tensor,
+    pred_4d: torch.Tensor,   # [B,C,H,W]
+    gt_4d: torch.Tensor,     # [B,C,H,W]
     *,
     save_error_heatmap: bool = False,
     spectrum_log_scale: bool = True,
     kbins: int = 64,
     cmap: str = "RdBu_r",
+    channel_names: Optional[Sequence[str]] = None,  # 新增：可传 ["u","v"]；不传则用 c0,c1...
 ) -> None:
     """
-    生成频谱图，并可选保存误差热力图（通道均值）
+    频谱评估（单/多通道自适应）：
+    - 单通道：与旧版一致：GT、Pred、|Pred−GT|
+    - 多通道（C>1）：
+        1) 逐通道谱：GT / Pred / |Pred−GT|，文件名：..._{name}.png
+        2) 总动能谱：Σ_c P_c(k)（逐通道径向功率之和），文件名：..._total.png
+        3) 互谱相干度：γ^2_uv(k)（目前仅对 C==2 计算），文件名：..._coh_u_v.png
     """
     import numpy as np
     import matplotlib.pyplot as plt
 
     with torch.no_grad():
-        pred = pred_4d.detach().cpu().float().numpy()
-        gt   = gt_4d.detach().cpu().float().numpy()
+        pred = pred_4d.detach().cpu().float().numpy()  # [B,C,H,W]
+        gt   = gt_4d.detach().cpu().float().numpy()    # [B,C,H,W]
         err  = np.abs(pred - gt)
 
+        B, C = pred.shape[:2]
+        names = list(channel_names) if (channel_names and len(channel_names) == C) else [f"c{i}" for i in range(C)]
+
+        # ---------- 工具：把 [B,C,H,W] 压到单幅 [H,W] ----------
+        def to_hw(a):  # a: [...,H,W]
+            a = np.asarray(a)
+            if a.ndim == 2:
+                return a
+            h, w = a.shape[-2], a.shape[-1]
+            return a.reshape(-1, h, w).mean(axis=0)  # 默认先对 batch/通道均值；上层会控制取哪个维度
+
+        # ---------- 工具：径向功率（自适应输入，保证 2D） ----------
+        def radial_power(img, bins: int) -> tuple[np.ndarray, np.ndarray]:
+            a = np.asarray(img)
+            if a.ndim > 2:
+                a = to_hw(a)
+            F = np.fft.fftshift(np.fft.fft2(a, norm="ortho"))
+            mag2 = np.abs(F) ** 2
+            H, W = mag2.shape
+            # 以像素半径分箱（1..bins），跳过 DC
+            cy, cx = H//2, W//2
+            yy, xx = np.ogrid[:H, :W]
+            r = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+            r_max = int(r.max())
+            nb = min(bins, max(r_max, 1))
+            edges = np.linspace(1, r_max, nb + 1)
+            ps = np.zeros(nb, dtype=np.float64)
+            for i in range(nb):
+                m = (r >= edges[i]) & (r < edges[i+1])
+                if m.any():
+                    ps[i] = mag2[m].mean()
+            radii = 0.5 * (edges[:-1] + edges[1:])
+            # 归一到 [0,1] 的“归一化波数”坐标，便于横轴对齐
+            x = radii / (radii.max() + 1e-12)
+            return x, ps
+
+        # ---------- 可选：误差热力图（通道均值） ----------
         if save_error_heatmap:
-            err_map = err.mean(axis=0)
+            err_map = err.mean(axis=(0, 1))  # [H,W]
             plt.figure()
             plt.imshow(err_map, interpolation="nearest", cmap=cmap)
-            plt.title("Error heatmap (|pred - gt|)")
+            plt.title("Error heatmap (|pred - gt|), mean over B,C")
             plt.colorbar()
             plt.tight_layout()
             plt.savefig(img_dir / f"{prefix}_error.png", dpi=200)
             plt.close()
 
-        def _radial_power(img2d: np.ndarray, bins: int) -> tuple[np.ndarray, np.ndarray]:
-            F = np.fft.fftshift(np.fft.fft2(img2d, norm="ortho"))
-            mag2 = np.abs(F) ** 2
-            H, W = mag2.shape
-            yy, xx = np.meshgrid(np.linspace(-1, 1, H), np.linspace(-1, 1, W), indexing="ij")
-            rr = np.sqrt(xx * xx + yy * yy)
-            rr /= (rr.max() + 1e-12)
-            bin_idx = np.clip((rr * bins).astype(np.int64), 0, bins - 1)
-            ps = np.zeros(bins, dtype=np.float64)
-            cnt = np.zeros(bins, dtype=np.float64)
-            for k in range(bins):
-                m = (bin_idx == k)
-                c = m.sum()
-                cnt[k] = c
-                if c > 0:
-                    ps[k] = mag2[m].mean()
-            x = np.arange(bins) / (bins - 1 + 1e-12)
-            return x, ps
-
-        x, p_pred = _radial_power(pred.mean(axis=0), kbins)
-        _, p_gt   = _radial_power(gt.mean(axis=0),   kbins)
-
-        p_err = np.abs(p_pred - p_gt)
-
         eps = 1e-12
-        if spectrum_log_scale:
-            p_pred = 10.0 * np.log10(p_pred + eps)
-            p_gt   = 10.0 * np.log10(p_gt   + eps)
-            p_err  = 10.0 * np.log10(p_err  + eps)
-            ylab   = "Radial power (dB)"
-        else:
-            ylab   = "Radial power"
+        def _maybe_db(y):
+            return 10.0 * np.log10(y + eps) if spectrum_log_scale else y
+        ylab = "Radial power (dB)" if spectrum_log_scale else "Radial power"
+
+        # =============== 情况 A：单通道 =================
+        if C == 1:
+            x, p_pred = radial_power(pred.mean(axis=0), kbins)  # [C,B,H,W]→均值到 [H,W]
+            _, p_gt   = radial_power(gt.mean(axis=0),   kbins)
+            p_err = np.abs(p_pred - p_gt)
+
+            plt.figure()
+            plt.plot(x, _maybe_db(p_gt),   label="GT")
+            plt.plot(x, _maybe_db(p_pred), label="Pred")
+            plt.plot(x, _maybe_db(p_err),  label="|Pred−GT|")
+            plt.xlabel("Normalized spatial frequency")
+            plt.ylabel(ylab)
+            plt.legend()
+            plt.title("Radial Power Spectrum")
+            plt.tight_layout()
+            plt.savefig(img_dir / f"{prefix}_rps.png", dpi=200)
+            plt.close()
+            return
+
+        # =============== 情况 B：多通道 =================
+        # 1) 逐通道谱
+        per_ch = {}   # name -> (x, p_gt, p_pred, p_err)
+        for ci, nm in enumerate(names):
+            x, p_pred = radial_power(pred[:, ci], kbins)  # 对 batch 维均值
+            _, p_gt   = radial_power(gt[:, ci],   kbins)
+            p_err = np.abs(p_pred - p_gt)
+            per_ch[nm] = (x, p_gt, p_pred, p_err)
+
+            plt.figure()
+            plt.plot(x, _maybe_db(p_gt),   label=f"GT[{nm}]")
+            plt.plot(x, _maybe_db(p_pred), label=f"Pred[{nm}]")
+            plt.plot(x, _maybe_db(p_err),  label=f"|Pred−GT|[{nm}]")
+            plt.xlabel("Normalized spatial frequency")
+            plt.ylabel(ylab)
+            plt.legend()
+            plt.title(f"Radial Power Spectrum — {nm}")
+            plt.tight_layout()
+            plt.savefig(img_dir / f"{prefix}_rps_{nm}.png", dpi=200)
+            plt.close()
+
+        # 2) 总“动能”谱（逐通道功率之和）
+        #    注意：能量应当是功率谱的和，而不是先把场相加再做谱
+        #    这里直接把各通道的径向功率序列相加（GT 与 Pred 各自相加）
+        #    （如果你未来做 3D/T 频谱，可换成在环上对 |F|^2 先求和再分箱）
+        x_ref = next(iter(per_ch.values()))[0]
+        p_gt_sum   = np.zeros_like(x_ref)
+        p_pred_sum = np.zeros_like(x_ref)
+        for (x, p_gt_c, p_pred_c, _) in per_ch.values():
+            p_gt_sum   = p_gt_sum   + p_gt_c
+            p_pred_sum = p_pred_sum + p_pred_c
+        p_err_sum = np.abs(p_pred_sum - p_gt_sum)
 
         plt.figure()
-        plt.plot(x, p_gt,   label="GT")
-        plt.plot(x, p_pred, label="Pred")
-        plt.plot(x, p_err,  label="|Pred−GT|")
+        plt.plot(x_ref, _maybe_db(p_gt_sum),   label="GT (Σ power)")
+        plt.plot(x_ref, _maybe_db(p_pred_sum), label="Pred (Σ power)")
+        plt.plot(x_ref, _maybe_db(p_err_sum),  label="|Pred−GT| (Σ)")
         plt.xlabel("Normalized spatial frequency")
         plt.ylabel(ylab)
         plt.legend()
-        plt.title("Radial Power Spectrum")
+        plt.title("Radial Power Spectrum — Total (Σ over channels)")
         plt.tight_layout()
-        plt.savefig(img_dir / f"{prefix}_rps.png", dpi=200)
+        plt.savefig(img_dir / f"{prefix}_rps_total.png", dpi=200)
         plt.close()
+
+        # 3) 互谱相干度（目前仅在 C==2 时计算）
+        if C == 2:
+            # 先把 batch 均值到单幅，再做互谱
+            def fft2(img):
+                F = np.fft.fftshift(np.fft.fft2(img, norm="ortho"))
+                return F
+
+            u_pred = to_hw(pred[:, 0])  # [H,W]
+            v_pred = to_hw(pred[:, 1])
+            u_gt   = to_hw(gt[:, 0])
+            v_gt   = to_hw(gt[:, 1])
+
+            Fu_pred, Fv_pred = fft2(u_pred), fft2(v_pred)
+            Fu_gt,   Fv_gt   = fft2(u_gt),   fft2(v_gt)
+
+            # 功率 & 互谱
+            Puu_pred = np.abs(Fu_pred) ** 2
+            Pvv_pred = np.abs(Fv_pred) ** 2
+            Puv_pred = Fu_pred * np.conj(Fv_pred)
+
+            Puu_gt = np.abs(Fu_gt) ** 2
+            Pvv_gt = np.abs(Fv_gt) ** 2
+            Puv_gt = Fu_gt * np.conj(Fv_gt)
+
+            # 环平均到径向：返回 (x, bin_mean)
+            def ringbin(arr):
+                H, W = arr.shape
+                cy, cx = H//2, W//2
+                yy, xx = np.ogrid[:H, :W]
+                r = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+                r_max = int(r.max())
+                nb = min(kbins, max(r_max, 1))
+                edges = np.linspace(1, r_max, nb + 1)
+                out = np.zeros(nb, dtype=np.complex128)
+                for i in range(nb):
+                    m = (r >= edges[i]) & (r < edges[i+1])
+                    if m.any():
+                        out[i] = arr[m].mean()
+                radii = 0.5 * (edges[:-1] + edges[1:])
+                x = radii / (radii.max() + 1e-12)
+                return x, out
+
+            x_pred, Puu_pred_r = ringbin(Puu_pred)
+            _,     Pvv_pred_r  = ringbin(Pvv_pred)
+            _,     Puv_pred_r  = ringbin(Puv_pred)
+            x_gt,   Puu_gt_r   = ringbin(Puu_gt)
+            _,      Pvv_gt_r   = ringbin(Pvv_gt)
+            _,      Puv_gt_r   = ringbin(Puv_gt)
+
+            coh_pred = (np.abs(Puv_pred_r) ** 2) / (Puu_pred_r.real * Pvv_pred_r.real + eps)
+            coh_gt   = (np.abs(Puv_gt_r) ** 2) / (Puu_gt_r.real * Pvv_gt_r.real + eps)
+
+            plt.figure()
+            plt.plot(x_pred, np.clip(coh_gt,   0, 1), label=f"GT coherence({names[0]},{names[1]})")
+            plt.plot(x_pred, np.clip(coh_pred, 0, 1), label=f"Pred coherence({names[0]},{names[1]})")
+            plt.xlabel("Normalized spatial frequency")
+            plt.ylabel("Magnitude-squared coherence")
+            plt.ylim(0, 1.05)
+            plt.legend()
+            plt.title("Inter-channel Coherence Spectrum")
+            plt.tight_layout()
+            plt.savefig(img_dir / f"{prefix}_coh_{names[0]}_{names[1]}.png", dpi=200)
+            plt.close()
 
 @torch.no_grad()
 def _relative_error_stats(
@@ -799,9 +990,27 @@ def render_eval_triplets(
 ) -> Path:
     """
     从测试集抽若干样本生成四联图与频谱图。
+    扩展：若输出为多通道，文件名追加通道标识（来自 out_names，回退 c{i}）。
     """
     if test_dl is None:
         return run_dir / "eval_vis"
+
+    # 读取通道名（输出侧）
+    def _get_out_channel_names(dl) -> List[str]:
+        names: List[str] = []
+        try:
+            ds = getattr(dl, "dataset", None)
+            meta = getattr(ds, "meta", None) if ds is not None else None
+            if isinstance(meta, dict):
+                ch = meta.get("channel_names") or {}
+                outs = ch.get("out_names")
+                if isinstance(outs, (list, tuple)):
+                    names = list(outs)
+        except Exception:
+            names = []
+        return names
+
+    out_names = _get_out_channel_names(test_dl)
 
     img_dir = ensure_dir(run_dir / "eval_vis")
     device = next(model.parameters()).device
@@ -828,23 +1037,51 @@ def render_eval_triplets(
             y_hat = y_hat.squeeze(2)
 
         take = min(x.shape[0], max_triplets - plotted)
+
+        # 统一 4D
+        x4  = x if x.ndim == 4 else x[:, :, 0]    # [B,C,H,W]
+        y4  = y if y.ndim == 4 else y[:, :, 0]
+        yh4 = y_hat if y_hat.ndim == 4 else y_hat[:, :, 0]
+
+        B, C, H, W = y4.shape
+        # 单通道与多通道两种命名
+        if not out_names or len(out_names) != C:
+            ch_names = [f"c{i}" for i in range(C)]
+        else:
+            ch_names = list(out_names)
+
         for idx in range(take):
-            save_quadruple_grid(
-                x[idx] if x.ndim == 4 else x[idx, :, 0],
-                y_hat[idx] if y_hat.ndim == 4 else y_hat[idx, :, 0],
-                y[idx] if y.ndim == 4 else y[idx, :, 0],
-                img_dir / f"triplet_b{batches}_i{idx}.png",
-            )
-            pred_4d = y_hat[idx] if y_hat.ndim == 4 else y_hat[idx, :, 0]
-            gt_4d   = y[idx]    if y.ndim == 4    else y[idx, :, 0]
-            prefix  = f"triplet_b{batches}_i{idx}"
-            _save_error_and_spectrum(
-                img_dir, prefix, pred_4d, gt_4d,
-                save_error_heatmap=save_err,
-                spectrum_log_scale=logscale,
-                kbins=kbins,
-                cmap=cmap,
-            )
+            if C == 1:
+                # 与旧版一致的单文件输出
+                save_quadruple_grid(
+                    x4[idx], yh4[idx], y4[idx],
+                    img_dir / f"triplet_b{batches}_i{idx}.png",
+                )
+                prefix  = f"triplet_b{batches}_i{idx}"
+                _save_error_and_spectrum(
+                    img_dir, prefix, yh4[idx:idx+1], y4[idx:idx+1],
+                    save_error_heatmap=save_err,
+                    spectrum_log_scale=logscale,
+                    kbins=kbins,
+                    cmap=cmap,
+                    channel_names=out_names,
+                )
+            else:
+                # 多通道：为每个通道单独出图，便于对照
+                for ci, tag in enumerate(ch_names):
+                    save_quadruple_grid(
+                        x4[idx], yh4[idx, ci:ci+1], y4[idx, ci:ci+1],
+                        img_dir / f"triplet_b{batches}_i{idx}_{tag}.png",
+                    )
+                    prefix  = f"triplet_b{batches}_i{idx}_{tag}"
+                    _save_error_and_spectrum(
+                        img_dir, prefix, yh4[idx:idx+1, ci:ci+1], y4[idx:idx+1, ci:ci+1],
+                        save_error_heatmap=save_err,
+                        spectrum_log_scale=logscale,
+                        kbins=kbins,
+                        cmap=cmap,
+                        channel_names=out_names,
+                    )
             plotted += 1
         batches += 1
     return img_dir

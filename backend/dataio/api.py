@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple
 import numpy as np
 import os
+import torch
 from torch.utils.data import DataLoader
 from .registry import build_reader, build_sampler, build_adapter
 from .transforms import (
@@ -295,14 +296,170 @@ def run(config: Dict[str, Any]):
 
     return dataset, dataloader, summary
 
+# 通道规划
+def _build_io_spec(data_cfg: Dict[str, Any], *, available_channels: Optional[list] = None) -> Dict[str, Any]:
+    """
+    根据 YAML 的 data.io 字段生成 io_spec：
+      input_channels = [predict_channels...] + [extras...]
+      target_channels = [predict_channels...]
+    extras 支持：
+      - P:      采样点位置通道（point_mask）
+      - P_val:  采样点×采样值（point_value）
+    """
+    io_cfg = (data_cfg.get("io") or {})
+    task = str(io_cfg.get("task", "reconstruct")).lower()
+    if task not in ("reconstruct", "separate"):
+        task = "reconstruct"  # 占位：仅支持复原任务
+
+    # 预测通道
+    predict_channels = list(io_cfg.get("predict_channels") or ["u"])
+    if available_channels:
+        for ch in predict_channels:
+            if ch not in available_channels:
+                raise KeyError(f"predict channel '{ch}' not in dataset channels {available_channels}")
+
+    # extras
+    extras_cfg = io_cfg.get("extras") or {}
+    use_P = bool(extras_cfg.get("point_mask", False))
+    use_Pv = bool(extras_cfg.get("point_value", False))
+
+    input_channels = list(predict_channels)
+    channel_alias = {}
+
+    if use_P:
+        input_channels.append("P")
+        channel_alias["P"] = "point_mask"
+    if use_Pv:
+        input_channels.append("P_val")
+        channel_alias["P_val"] = "point_value"
+
+    io_spec = {
+        "task": task,
+        "input_channels": input_channels,
+        "target_channels": list(predict_channels),
+        "num_in": len(input_channels),
+        "num_out": len(predict_channels),
+        "channel_alias": channel_alias,
+        "predict_channels": list(predict_channels),
+    }
+    return io_spec
+
+class _MappedDatasetV2:
+    """
+    包装基础数据集（从快照恢复的 dataset 或任何 __getitem__ -> dict 样本的 dataset），
+    依据 io_spec 组装 x/y：
+      x = [predict_channels...] + [P?] + [P_val?]
+      y = [predict_channels...]
+    其中：
+      - 原始样本若为 {'u','v',...}，直接按键取；
+      - 若为 {'x': CxHxW, 'y': C'xHxW} 且没有命名通道，则尝试从 y 推断（y 的通道顺序作为 predict_channels 的来源）。
+    """
+    def __init__(self, base_ds, io_spec: Dict[str, Any],
+                 *, sample_density: Optional[float], noise_sigma: Optional[float],
+                 rng_seed: int = 1234, base_fallback: Optional[str] = "u"):
+        from torch.utils.data import Dataset as _TorchDataset  # 为了 isinstance 判断
+        self.base = base_ds
+        self.io_spec = io_spec
+        self.sample_density = sample_density
+        self.noise_sigma = noise_sigma
+        self.rng = np.random.RandomState(int(rng_seed))
+        self.base_fallback = base_fallback
+
+        # 试探 dataset 可见通道名（仅用于报错/提示）
+        self.available = None
+        try:
+            s0 = base_ds[0]
+            self.available = list(s0.keys())
+        except Exception:
+            self.available = None
+
+    def __len__(self):
+        return len(self.base)
+
+    def _to_numpy(self, arr):
+        import torch as _torch, numpy as _np
+        if isinstance(arr, _torch.Tensor):
+            return arr.detach().cpu().numpy()
+        return _np.asarray(arr)
+
+    def _make_mask_like(self, arr_hw, p: Optional[float]):
+        if p is None or p <= 0.0:
+            return np.zeros(arr_hw, dtype=np.uint8)
+        h, w = arr_hw
+        num = int(round(p * h * w))
+        idx = self.rng.choice(h * w, size=num, replace=False)
+        mask = np.zeros(h * w, dtype=np.uint8)
+        mask[idx] = 1
+        return mask.reshape(h, w)
+
+    def _extract_named_channel(self, sample: Dict[str, Any], name: str) -> np.ndarray:
+        """
+        优先从命名键（'u','v',...）取；若不存在，尝试从 'y'（或 'x'）按通道顺序映射。
+        """
+        if name in sample:
+            a = self._to_numpy(sample[name]).astype(np.float32)
+            # 兼容 [1,H,W]
+            if a.ndim == 3 and a.shape[0] == 1:
+                a = a[0]
+            return a
+        # 回退：若 y 存在且 predict_channels 的顺序与 y 的通道一致，则用对应索引
+        if "y" in sample:
+            Y = self._to_numpy(sample["y"]).astype(np.float32)
+            # [C,H,W] or [H,W]
+            if Y.ndim == 2:
+                if len(self.io_spec["target_channels"]) == 1:
+                    return Y
+                raise ValueError("target is 2D but predict_channels>1; cannot map.")
+            if Y.ndim == 3:
+                # 假设 y 的顺序就是 predict_channels 的顺序
+                try:
+                    idx = self.io_spec["target_channels"].index(name)
+                except ValueError:
+                    raise KeyError(f"Channel '{name}' not found in target_channels {self.io_spec['target_channels']}.")
+                return Y[idx]
+        # 再回退：若 x 存在（但无语义），无法可靠映射 -> 抛错
+        raise KeyError(f"Cannot extract channel '{name}' from sample keys {list(sample.keys())}.")
+
+    def __getitem__(self, idx):
+        sample = self.base[idx]
+        in_chs = self.io_spec["input_channels"]
+        tgt_chs = self.io_spec["target_channels"]
+
+        # 先构建预测源（同名通道）
+        in_maps = [self._extract_named_channel(sample, ch) for ch in in_chs if ch not in ("P", "P_val")]
+        tgt_maps = [self._extract_named_channel(sample, ch) for ch in tgt_chs]
+
+        # 用“第一个预测源通道”的尺寸来生成采样相关通道
+        ref = in_maps[0] if len(in_maps) > 0 else tgt_maps[0]
+        H, W = ref.shape[-2], ref.shape[-1]
+
+        # 采样点：基于第一个预测源通道生成 mask 与 obs
+        #（你也可以后续扩展为对每个预测源通道分别生成；目前保持论文中“单位置编码”的语义）
+        mask = self._make_mask_like((H, W), self.sample_density).astype(np.float32)
+        obs = ref.astype(np.float32).copy()
+        if self.noise_sigma is not None and float(self.noise_sigma) > 0.0:
+            obs = obs + self.rng.normal(0.0, float(self.noise_sigma), size=obs.shape).astype(np.float32)
+        obs_times_mask = obs * mask
+
+        # 拼装 extras
+        x_parts = list(in_maps)
+        if "P" in in_chs:
+            x_parts.append(mask)
+        if "P_val" in in_chs:
+            x_parts.append(obs_times_mask)
+
+        x = np.stack(x_parts, axis=0).astype(np.float32)   # [C_in,H,W]
+        y = np.stack(tgt_maps, axis=0).astype(np.float32)   # [C_out,H,W]
+        return {"x": x, "y": y}
+
 def build_all(
     *,
     snapshot_dir: str,
-    # 因子化注入（训练侧会把 data.factors 合并注入到这里）
+    # 因子化注入
     sample_density: Optional[float] = None,
     noise_sigma: Optional[float] = None,
     rng_seed_offset: int = 0,
-    # DataLoader 相关参数（训练侧 data.* 会透传到这里；若未传则用默认）
+    # DataLoader 常用参数
     batch_size: int = 32,
     num_workers: int = 8,
     pin_memory: bool = True,
@@ -311,28 +468,26 @@ def build_all(
     drop_last: bool = False,
     shuffle: bool = True,
     split: Optional[Dict[str, Any]] = None,
-    # 允许冗余参数（从 data_cfg 透传进来，不影响逻辑）
+    # 透传 data 配置（含 data.io、legacy_three_channel_input 等）
     **data_cfg,
 ) -> Tuple[DataLoader, Optional[DataLoader], DataLoader]:
     """
-    v2 统一数据入口（builder 模式）：
-      1) 先用 v1 的 build_from_snapshot 恢复基础 train/val/test DataLoader；
-      2) 在不改变样本划分的前提下，用本地 adapter collate 构造“三输入通道”（recon / mask / obs*mask），
-         目标保持单通道（与 v1 兼容：target_channels=["u"]）；
-      3) 返回新的 train/val/test 三个 DataLoader。
+    v2 统一数据入口：
+      - 若 data.legacy_three_channel_input=true → 兼容旧“三通道硬编码”；
+      - 否则根据 data.io 组装：
+          x = [predict_channels...] + [P?] + [P_val?]
+          y = [predict_channels...]
     """
-    import random
-    import torch
+    import os
+    from torch.utils.data import DataLoader
 
-    # 容错：目录别名（用户若传了 nc_full，尝试 nc_full_v2）
+    # 目录别名容错
     if not os.path.isdir(snapshot_dir):
         alt = snapshot_dir.rstrip("/\\") + "_v2"
         if os.path.isdir(alt):
             snapshot_dir = alt
 
-    # ---------- 第一步：用 v1 的逻辑从快照恢复基础 dataloaders ----------
-    # 注意：此处先不给任何自定义 collate，让它按快照恢复最原始的样本结构（dict：含 'u','v' 等）
-    #       随后我们用自己的 collate 替换，以构造三输入通道。
+    # 先从快照恢复基础 dataloaders（保持最原始样本字典结构）
     base_train, base_val, base_test = build_from_snapshot(snapshot_dir, {
         "batch_size": batch_size,
         "num_workers": num_workers,
@@ -347,95 +502,118 @@ def build_all(
                                                     "seed": 123}
     })
 
-    # ---------- 第二步：p-σ 因子注入 + 三输入通道（样本级映射，保持原 collate 不变） ----------
-    import torch
-    from torch.utils.data import Dataset
+    # --- 路由：legacy 旧三通道 vs 新 io_spec ---
+    legacy = bool(data_cfg.get("legacy_three_channel_input", False))
+    rng_base = 1234 + int(rng_seed_offset)
 
-    base_channel = data_cfg.get("base_channel", "u")          # 与 v1 约定保持一致
-    target_channels = data_cfg.get("target_channels", ["u"])  # 目前保持单通道预测
+    if legacy:
+        # 复用原先的“三通道”逻辑（保持不变）
+        base_channel = data_cfg.get("base_channel", "u")
+        def _rebuild_legacy(base_dl: Optional[DataLoader]) -> Optional[DataLoader]:
+            if base_dl is None:
+                return None
+            # 直接沿用你现有 _MappedDataset（原函数体保持不变）
+            # 这里内联旧实现以免交叉引用；或将原 _MappedDataset 重命名为 _MappedDatasetLegacy。
+            import numpy as _np
+            import torch as _torch
+            rng = np.random.RandomState(rng_base)
 
-    rng = np.random.RandomState(1234 + int(rng_seed_offset))
-    torch.manual_seed(1234 + int(rng_seed_offset))
+            def _make_mask_like(arr_hw, p):
+                if p is None or p <= 0.0:
+                    return np.zeros(arr_hw, dtype=np.uint8)
+                h, w = arr_hw
+                num = int(round(p * h * w))
+                idx = rng.choice(h * w, size=num, replace=False)
+                mask = np.zeros(h * w, dtype=np.uint8)
+                mask[idx] = 1
+                return mask.reshape(h, w)
 
-    def _make_mask_like(arr_hw, p: Optional[float]):
-        if p is None or p <= 0.0:
-            return np.zeros(arr_hw, dtype=np.uint8)
-        h, w = arr_hw
-        num = int(round(p * h * w))
-        idx = rng.choice(h * w, size=num, replace=False)
-        mask = np.zeros(h * w, dtype=np.uint8)
-        mask[idx] = 1
-        return mask.reshape(h, w)
+            def _naive_inpaint(observed_map, mask):
+                if mask.sum() == 0:
+                    return np.zeros_like(observed_map, dtype=observed_map.dtype)
+                mean_val = observed_map[mask > 0].mean()
+                out = observed_map.copy()
+                out[mask == 0] = mean_val
+                return out
 
-    def _naive_inpaint(observed_map, mask):
-        if mask.sum() == 0:
-            return np.zeros_like(observed_map, dtype=observed_map.dtype)
-        mean_val = observed_map[mask > 0].mean()
-        out = observed_map.copy()
-        out[mask == 0] = mean_val
-        return out
+            def _to_numpy(arr):
+                if isinstance(arr, _torch.Tensor):
+                    return arr.detach().cpu().numpy()
+                return _np.asarray(arr)
 
-    def _to_numpy(arr):
-        import numpy as _np
-        import torch as _torch
-        if isinstance(arr, _torch.Tensor):
-            return arr.detach().cpu().numpy()
-        return _np.asarray(arr)
+            class _MappedDatasetLegacy(torch.utils.data.Dataset):
+                def __init__(self, base_ds):
+                    self.base = base_ds
+                def __len__(self):
+                    return len(self.base)
+                def __getitem__(self, idx):
+                    sample = self.base[idx]
+                    if base_channel in sample:
+                        base_map = _to_numpy(sample[base_channel]).astype(np.float32)
+                        if base_map.ndim == 3 and base_map.shape[0] == 1:
+                            base_map = base_map[0]
+                    elif "y" in sample:
+                        y0 = _to_numpy(sample["y"]).astype(np.float32)
+                        if y0.ndim == 2:
+                            base_map = y0
+                        elif y0.ndim == 3:
+                            base_map = y0[0]
+                        else:
+                            raise ValueError(f"Unsupported 'y' shape {y0.shape} in snapshot sample.")
+                    else:
+                        raise KeyError(f"Snapshot sample missing base channel '{base_channel}' and key 'y'. Keys={list(sample.keys())}")
 
-    class _MappedDataset(Dataset):
-        """对 base_dataset 做样本级映射：生成三输入通道 x 和单通道目标 y。
-        不改 collate，让下游保持 batch.x / batch.y 的属性访问行为。"""
-        def __init__(self, base_ds):
-            self.base = base_ds
-        def __len__(self):
-            return len(self.base)
-        def __getitem__(self, idx):
-            sample = self.base[idx]
+                    H, W = base_map.shape[-2], base_map.shape[-1]
+                    mask = _make_mask_like((H, W), sample_density)
+                    obs = base_map.astype(np.float32).copy()
+                    if noise_sigma is not None and noise_sigma > 0.0:
+                        obs = obs + rng.normal(0.0, float(noise_sigma), size=obs.shape).astype(np.float32)
+                    obs_times_mask = obs * mask.astype(np.float32)
+                    recon = _naive_inpaint(obs_times_mask, mask)
 
-            # 取“干净底图”u_map：兼容两种快照规范
-            # A) {'u': HxW, 'v': HxW, ...}
-            # B) {'x': CxHxW, 'y': C'xHxW}（干净底稿：用 y 的第 0 通道作为底图）
-            if base_channel in sample:
-                u_map = _to_numpy(sample[base_channel]).astype(np.float32)
-                if u_map.ndim == 3 and u_map.shape[0] == 1:
-                    u_map = u_map[0]
-            elif "y" in sample:
-                y0 = _to_numpy(sample["y"]).astype(np.float32)
-                if y0.ndim == 2:
-                    u_map = y0
-                elif y0.ndim == 3:
-                    u_map = y0[0]
-                else:
-                    raise ValueError(f"Unsupported 'y' shape {y0.shape} in snapshot sample.")
-            else:
-                raise KeyError(f"Snapshot sample missing base channel '{base_channel}' and key 'y'. Keys={list(sample.keys())}")
+                    x = np.stack([recon, mask.astype(np.float32), obs_times_mask], axis=0).astype(np.float32)
+                    y = base_map.astype(np.float32)[None, ...]
+                    return {"x": x, "y": y}
 
-            H, W = u_map.shape[-2], u_map.shape[-1]
-            mask = _make_mask_like((H, W), sample_density)
+            ds = _MappedDatasetLegacy(base_dl.dataset)
+            collate_fn = base_dl.collate_fn
+            opts = dict(
+                batch_size=batch_size,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=(persistent_workers if (num_workers and num_workers > 0) else False),
+                shuffle=getattr(base_dl, "shuffle", shuffle),
+                drop_last=drop_last,
+                collate_fn=collate_fn,
+            )
+            if prefetch_factor is not None and num_workers and num_workers > 0:
+                opts["prefetch_factor"] = prefetch_factor
+            return DataLoader(ds, **opts)
 
-            obs = u_map.astype(np.float32).copy()
-            if noise_sigma is not None and noise_sigma > 0.0:
-                obs = obs + rng.normal(0.0, float(noise_sigma), size=obs.shape).astype(np.float32)
+        return _rebuild_legacy(base_train), _rebuild_legacy(base_val), _rebuild_legacy(base_test or base_val)
 
-            obs_times_mask = obs * mask.astype(np.float32)
-            recon = _naive_inpaint(obs_times_mask, mask)
+    # --- 新：按 io_spec 组装 ---
+    # 1) 探测可用通道名（从样本键）
+    try:
+        probe_sample = base_train.dataset[0] if base_train is not None else (base_val.dataset[0] if base_val is not None else base_test.dataset[0])
+        available = [k for k in probe_sample.keys() if k not in ("x", "y", "cond")]
+    except Exception:
+        available = None
 
-            x = np.stack([recon, mask.astype(np.float32), obs_times_mask], axis=0).astype(np.float32)
-            y = u_map.astype(np.float32)[None, ...]  # 单通道目标
+    io_spec = _build_io_spec(data_cfg, available_channels=available)
 
-            # IMPORTANT: 返回 dict（与 v1 快照样本契约一致：per-sample 是 dict）
-            # 原有 collate 会把 batch 封装成支持 batch.x / batch.y 的对象；不要在这里改成别的类型。
-            return {"x": x, "y": y}
-
-    # ---------- 第三步：复用“原始 dataloader 的 collate_fn”，仅替换 dataset 与常用 loader 选项 ----------
-    def _rebuild_like(base_dl: Optional[DataLoader]) -> Optional[DataLoader]:
+    def _rebuild_v2(base_dl: Optional[DataLoader]) -> Optional[DataLoader]:
         if base_dl is None:
             return None
-        ds = _MappedDataset(base_dl.dataset)
-        # 沿用 v1 的 collate_fn（它会把 batch 封装为支持属性访问的对象）
+        ds = _MappedDatasetV2(
+            base_dl.dataset,
+            io_spec,
+            sample_density=sample_density,
+            noise_sigma=noise_sigma,
+            rng_seed=rng_base,
+            base_fallback=(data_cfg.get("base_channel") or "u"),
+        )
         collate_fn = base_dl.collate_fn
-
-        # 覆盖常用选项；其余沿用基础 loader 的 worker 等特性
         opts = dict(
             batch_size=batch_size,
             num_workers=num_workers,
@@ -449,8 +627,4 @@ def build_all(
             opts["prefetch_factor"] = prefetch_factor
         return DataLoader(ds, **opts)
 
-    train_dl = _rebuild_like(base_train)
-    val_dl   = _rebuild_like(base_val)
-    test_dl  = _rebuild_like(base_test or base_val)  # 若无 test，用 val 兜底
-
-    return train_dl, val_dl, test_dl
+    return _rebuild_v2(base_train), _rebuild_v2(base_val), _rebuild_v2(base_test or base_val)

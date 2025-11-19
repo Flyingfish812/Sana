@@ -31,6 +31,17 @@ class EPDSystem(pl.LightningModule):
         self.data_meta = data_meta or {}
         self.log_images_every_n_steps = log_images_every_n_steps
 
+        try:
+            expected = int(self.data_meta.get("num_out")) if self.data_meta and self.data_meta.get("num_out") is not None else None
+            if expected is not None:
+                head_args = head.setdefault("args", {})
+                o_user = head_args.get("out_channels")
+                if (o_user is None) or (int(o_user) != expected):
+                    # 以数据侧为准
+                    head_args["out_channels"] = expected
+        except Exception:
+            pass
+
         self.encoder = build_component("encoder", encoder)
         self.propagator = build_component("propagator", propagator)
         self.decoder = build_component("decoder", decoder)

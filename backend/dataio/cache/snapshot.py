@@ -259,20 +259,13 @@ def load_snapshot_as_dataloader(
     shuffle: bool = False,
     **loader_kwargs,
 ) -> Tuple[DataLoader, Dict[str, Any]]:
-    """
-    从快照目录恢复 DataLoader。
-      - 若 max_ram_gb 足够（或 force_streaming=False 且满足），则一次性整载入内存 → TensorDataset → DataLoader
-      - 否则返回流式 IterableDataset → DataLoader（分片顺序读取）
-    返回 (dataloader, info)；info 中含 "mode": "in_memory"|"streaming"
-    """
     for k in ("batch_size", "shuffle", "num_workers"):
         if k in loader_kwargs:
             loader_kwargs.pop(k)
-    # 低开销保护：当 num_workers==0 时，避免 DataLoader 因不合法组合报错
     if num_workers == 0:
         loader_kwargs.pop("persistent_workers", None)
         loader_kwargs.pop("prefetch_factor", None)
-    
+
     p = Path(dir_path)
     idx_path = p / "snapshot_index.json"
     if not idx_path.exists():
@@ -284,8 +277,8 @@ def load_snapshot_as_dataloader(
     parts = idx["parts"]
     keys = idx["keys"]
     compressed = bool(idx.get("compressed", False))
+    meta_json = dict(idx.get("meta", {}))  # ★ 把 meta 取出
 
-    # 判断是否整载入内存
     def _bytes_to_gb(b: int) -> float:
         return b / (1 << 30)
 
@@ -294,7 +287,6 @@ def load_snapshot_as_dataloader(
     )
 
     if can_in_memory and len(parts) > 0:
-        # 一次性读入所有分片，拼成大张量
         buffers: Dict[str, List[torch.Tensor]] = {k: [] for k in keys}
         for it in parts:
             fn = it["file"]
@@ -306,19 +298,19 @@ def load_snapshot_as_dataloader(
                 payload = _safe_torch_load(fp, map_location="cpu")
             for k in keys:
                 buffers[k].append(payload[k])
-        # cat -> big tensors
         stacked: Dict[str, torch.Tensor] = {k: torch.cat(vs, dim=0) for k, vs in buffers.items() if len(vs) > 0}
-        # 构建 in-memory dataset
         ds = _InMemoryTensorDataset(**stacked)
         dl = DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, **loader_kwargs)
-        return dl, {"mode": "in_memory", "num_samples": len(ds), "parts": len(parts)}
+        info = {"mode": "in_memory", "num_samples": len(ds), "parts": len(parts), "meta": meta_json}
+        return dl, info
     else:
-        # ---- streaming：IterableDataset 不支持 shuffle，忽略任何 shuffle 请求 ----
         if shuffle:
             warnings.warn("IterableDataset 不支持 shuffle；已忽略 shuffle=True。", RuntimeWarning)
         ds = _ShardIterator(str(p), parts, compressed)
-        dl = DataLoader(ds, batch_size=batch_size, num_workers=num_workers, **loader_kwargs)  # 不传 shuffle
-        return dl, {"mode": "streaming", "parts": len(parts)}
+        dl = DataLoader(ds, batch_size=batch_size, num_workers=num_workers, **loader_kwargs)
+        info = {"mode": "streaming", "parts": len(parts), "meta": meta_json}
+        return dl, info
+
 
 def load_snapshot_as_base_dataset(
     dir_path: str,
@@ -326,19 +318,6 @@ def load_snapshot_as_base_dataset(
     max_ram_gb: Optional[float] = None,
     force_streaming: bool = False,
 ) -> Tuple[torch.utils.data.Dataset, Dict[str, Any]]:
-    """
-    从快照目录恢复“基础 Dataset”（不直接构造 DataLoader）。
-    - 若内存允许（或未强制流式），整载入所有分片并拼为大张量，返回 _InMemoryTensorDataset
-    - 否则返回流式 _ShardIterator（IterableDataset）
-    返回 (dataset, info)；info 含：
-      - "mode": "in_memory" | "streaming"
-      - "num_samples": int （仅 in_memory 时提供）
-      - "parts": int
-      - "keys": List[str]
-      - "batch_first_shapes": Dict[str, List[int]]
-      - "factorized_base": bool
-      - "base_mode": str
-    """
     p = Path(dir_path)
     idx_path = p / "snapshot_index.json"
     if not idx_path.exists():
@@ -351,6 +330,8 @@ def load_snapshot_as_base_dataset(
     keys = idx["keys"]
     compressed = bool(idx.get("compressed", False))
 
+    meta_json = dict(idx.get("meta", {}))  # ★ 保留 index.meta
+
     def _bytes_to_gb(b: int) -> float:
         return b / (1 << 30)
 
@@ -358,7 +339,6 @@ def load_snapshot_as_base_dataset(
         (max_ram_gb is None) or (_bytes_to_gb(total_bytes) <= max_ram_gb)
     )
 
-    # 构造 info（无论 in_memory/streaming）
     info = {
         "parts": len(parts),
         "keys": list(keys),
@@ -366,6 +346,7 @@ def load_snapshot_as_base_dataset(
         "factorized_base": bool(idx.get("factorized_base", True)),
         "base_mode": str(idx.get("base_mode", idx.get("meta", {}).get("base_mode", "clean"))),
         "version": int(idx.get("version", 1)),
+        "meta": meta_json,  # ★ 回传
     }
 
     if can_in_memory and len(parts) > 0:
