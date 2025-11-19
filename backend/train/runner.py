@@ -4,6 +4,7 @@ from typing import Dict, Tuple, Optional
 from pathlib import Path
 from torch.utils.data import DataLoader
 import json
+import time
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 
@@ -149,13 +150,12 @@ def _run_single(
     run_suffix: Optional[str] = None,
     injected_dls: Optional[Tuple[Optional[DataLoader], Optional[DataLoader], Optional[DataLoader]]] = None,
 ) -> Tuple[EPDSystem, Dict[str, str]]:
+    t_start = time.perf_counter()
     import torch
     try:
         torch.set_float32_matmul_precision("high")
     except Exception:
         pass
-
-    cfg = load_config(cfg)
 
     if run_suffix:
         base_ver = cfg["logging"].get("version")
@@ -257,6 +257,8 @@ def _run_single(
     else:
         eval_vis = run_dir / "eval_vis"
 
+    elapsed = time.perf_counter() - t_start
+    print(f"Run completed in {elapsed:.2f} seconds.")
     artefacts = {
         "run_dir": str(run_dir),
         "best_checkpoint": str(best_ckpt) if best_ckpt else "",
@@ -264,6 +266,7 @@ def _run_single(
         "eval_log": str(run_dir / "eval_log.jsonl"),
         "eval_vis": str(eval_vis),
         "eval_vis_ms": str(run_dir / "eval_vis_ms"),
+        "runtime_seconds": float(elapsed),
     }
     return model, artefacts
 
@@ -333,6 +336,7 @@ def run_training(
         # 记录 sweep 汇总行（轻量）
         summary_lines.append({
             "suffix": suffix,
+            "runtime_seconds": artefacts.get("runtime_seconds", -1.0),
             "p": p,
             "sigma": s,
             "run_dir": artefacts.get("run_dir", ""),
