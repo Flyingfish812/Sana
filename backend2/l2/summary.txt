@@ -1,0 +1,70 @@
+L2 Pipeline Summary
+
+A) 训练入口: run_l2_train(config)
+
+1) 运行上下文与目录
+- 创建 ArtifactManager(artifacts_dir, dataset_id, exp_name, run_name)
+- ensure_run_dirs() 创建 run/ckpt/logs/infer/probe 目录
+- 写入 train_config.json 与 code_version.json
+
+2) 随机种子与设备
+- _seed_all(seed) 设置 random/numpy/torch 种子
+- _device_of(config) 解析训练设备（auto/cuda/cpu）
+
+3) 读取 L1 产物并构造样本对
+- load_l1_array(manager):
+  - 读 L1 manifest.json -> 还原 reader 配置
+  - build_reader + read_array5d 读取原始 array5d
+  - 读 stats_train.json -> NormSpec.from_stats
+- load_split_pairs(manager, manifest, 'train'/'val', split_tag, target_offset)
+  - frame/sequence 索引转换为 (n,t) 对
+  - target 为 t + target_offset
+
+4) DataLoader 与模型
+- PairDataset(array5d, pairs, norm, target_offset)
+- DataLoader(train/val)
+- BaselineUNet(in_channels=C, out_channels=C, ...)
+- Optimizer: Adam
+- Loss: MSELoss
+
+5) 训练循环
+- 每轮:
+  - train: 前向、反向、参数更新
+  - val: 前向评估
+  - 记录 train_loss/val_loss 到 logs/train_log.jsonl
+  - 保存 model_last.pt
+  - 若 val 更优，更新 model_best.pt
+
+6) 训练返回
+- 返回 run_dir、ckpt_last、ckpt_best、train_log、best_val_loss 等摘要
+
+
+B) 推理入口: run_l2_infer(config)
+
+1) 运行上下文
+- ArtifactManager + ensure_run_dirs()
+- 读取 L1 array/manifest/norm
+- 加载 test split -> 构建 test PairDataset + DataLoader
+
+2) 加载模型
+- 默认从 ckpt/model_best.pt 读取（或显式 ckpt_path）
+- 构建同结构 BaselineUNet 并 load_state_dict
+
+3) 推理与收集
+- 遍历 test_loader，收集 input/mask/gt/pred/pair_nt
+- 可选 ProbeController 在模型关键层执行统计/快照
+
+4) 指标与产物落盘
+- regression_metrics(y_true, y_pred) -> mse/mae/rmse
+- 保存 infer/preds_test.npz（包含 input/obs/mask/gt/pred/pair_nt）
+- 保存 infer/metrics_test.json
+- 若 probe 启用，保存 probe_summary / snapshots / full_dump
+
+5) 推理返回
+- 返回 run 信息、metrics、preds/metrics/probe 文件路径
+
+
+完整依赖链
+L1(run_l1_pipeline) -> 生成 manifest/splits/stats
+L2 train(run_l2_train) -> 消费 L1 产物并训练
+L2 infer(run_l2_infer) -> 消费 L1 产物 + 训练ckpt 并产出预测与评估

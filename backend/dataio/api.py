@@ -6,6 +6,7 @@ import numpy as np
 import os
 import torch
 from torch.utils.data import DataLoader
+from pytorch_lightning.utilities import rank_zero_only
 from .registry import build_reader, build_sampler, build_adapter
 from .transforms import (
     Compose,
@@ -210,18 +211,33 @@ def get_base_dataset_from_snapshot(
     )
     return dataset, info
 
+@rank_zero_only
+def _export_data_outputs(dataset, dataloader, summary, output_cfg):
+    """
+    单独抽出 export 部分，保证只有 rank0 会调用 dump_prep_outputs。
+    """
+    from .io.exporters import dump_prep_outputs
+    dump_prep_outputs(
+        dataset=dataset,
+        dataloader=dataloader,
+        summary=summary,
+        output_cfg=output_cfg,
+    )
+
 def run(config: Dict[str, Any]):
     """
     轻量化一键入口：只需准备一个 config，即可：
       Reader → Sampler → Transforms → Dataset → Adapter/Collate → DataLoader(s) → Summary
     返回 (dataset, dataloader_or_dict, summary_dict)
-    - 若未开启 split：dataloader 为单个 DataLoader，summary 为单份摘要
-    - 若开启 split：dataloader 为 {train/val/test} 字典，summary 包含每个 split 的摘要与全局切分统计
+
+    多进程适配点：
+      - dataset / dataloader 构造在所有 rank 上执行（必要）
+      - 但 "output/export" 部分仅由 global rank0 执行
     """
     dataset, info = build_dataset(config)
-    dataloader = build_dataloader(config, dataset)  # 允许内部按 config['split'] 返回 dict
+    dataloader = build_dataloader(config, dataset)
 
-    # --- 汇总 summary ---
+    # --- 汇总 summary --- 
     def _summarise_one(dl):
         return summarise_pipeline(info, dl)
 
@@ -230,19 +246,15 @@ def run(config: Dict[str, Any]):
     split_enabled = bool(split_cfg.get("enable", False))
 
     if not split_enabled or not isinstance(dataloader, dict):
-        # 单一 DataLoader
         summary = _summarise_one(dataloader)
     else:
-        # 多 DataLoader（train/val/test）
         split_summaries = {}
         sizes, total = {}, 0
         for name, dl in dataloader.items():
             split_summaries[name] = _summarise_one(dl)
-            # 统计样本数（尽量稳健）
             try:
-                sizes[name] = len(dl.dataset)  # SubsetDataset.dataset / 普通 Dataset
+                sizes[name] = len(dl.dataset)
             except Exception:
-                # 兜底：按 batch 数 × batch_size 粗估
                 try:
                     sizes[name] = len(dl) * next(iter(dl))["x"].shape[0]
                 except Exception:
@@ -265,27 +277,25 @@ def run(config: Dict[str, Any]):
             }
         }
 
-    # --- 导出（支持单一或多 split）---
+    # --- 导出（仅 rank0 执行）---
     output_cfg = config.get("output")
     if output_cfg:
-        from copy import deepcopy
-        from .io.exporters import dump_prep_outputs
-
         if not (split_enabled and isinstance(dataloader, dict)):
-            # 单一 DataLoader：原样导出
-            dump_prep_outputs(dataset=dataset, dataloader=dataloader, summary=summary, output_cfg=output_cfg)
+            # 单一 DataLoader
+            _export_data_outputs(dataset, dataloader, summary, output_cfg)
         else:
-            # 多 split：分别落到 out_dir/<split>/
+            # 多 split：分别落盘
+            from copy import deepcopy
             base = deepcopy(output_cfg)
             base_out = base.get("out_dir", "./prep_out")
+
             for name, dl in dataloader.items():
                 oc = deepcopy(base)
                 oc["out_dir"] = os.path.join(base_out, name)
-                # 为每个 split 单独带上它的 summary（若存在）
                 s_one = summary["splits"].get(name, {})
-                dump_prep_outputs(dataset=dataset, dataloader=dl, summary=s_one, output_cfg=oc)
+                _export_data_outputs(dataset, dl, s_one, oc)
 
-            # 另外把全局切分概览也保存到 base_out 根目录（可选）
+            # 写 split_overview.json（rank0）
             try:
                 os.makedirs(base_out, exist_ok=True)
                 with open(os.path.join(base_out, "split_overview.json"), "w", encoding="utf-8") as f:

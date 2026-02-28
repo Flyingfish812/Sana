@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, List, Tuple, Optional, Iterable, Any
 from pathlib import Path
 import numpy as np
+from pytorch_lightning.utilities import rank_zero_only
 
 from .io import load_sweep_records, read_eval_metric_mean, read_eval_available_keys
 from .metrics import metric_specs, summarize_metric_grid
@@ -385,6 +386,7 @@ def _write_markdown_report_v2(
 
     report_md.write_text("\n".join(lines), encoding="utf-8")
 
+@rank_zero_only
 def run_report(
     summary_dir: str | Path,
     out_dir: Optional[str | Path] = None,
@@ -506,6 +508,7 @@ def _iter_ms_pairs(ms_dir: Path) -> List[Tuple[Optional[Path], Optional[Path]]]:
         pairs.append((strips.get(k), curves.get(k)))
     return pairs
 
+@rank_zero_only
 def append_multiscale_section(
     run_dir: Path,
     *,

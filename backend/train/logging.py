@@ -4,6 +4,7 @@ from typing import Dict, Any
 from pathlib import Path
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
+from pytorch_lightning.utilities import rank_zero_only
 import yaml
 import json
 
@@ -16,33 +17,54 @@ def prepare_run_dir(cfg: Dict, only_prepare: bool = False) -> Path:
 
     # 冻结一份配置到 run_dir
     if not only_prepare:
-        (run_dir / "config.dump.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        (run_dir / "config.dump.yaml").write_text(
+            yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True),
+            encoding="utf-8"
+        )
     return run_dir
 
 class JSONLLogger(pl.loggers.Logger):
     """极简 JSONL Logger：把 logger.experiment.write(rec) 映射到 jsonl 文件"""
     def __init__(self, save_dir: str, name: str, version: str):
         super().__init__()
-        self._save_dir = Path(save_dir); self._name = name; self._version = version
+        self._save_dir = Path(save_dir)
+        self._name = name
+        self._version = version
         self._path = self._save_dir / name / version / "events" / "metrics.jsonl"
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._f = self._path.open("a", encoding="utf-8")
 
     @property
-    def name(self): return "jsonl"
-    @property
-    def version(self): return self._version
-    @property
-    def experiment(self): return self  # 兼容 write
+    def name(self):
+        return "jsonl"
 
+    @property
+    def version(self):
+        return self._version
+
+    @property
+    def experiment(self):
+        return self  # 兼容 write
+
+    @rank_zero_only
     def log_metrics(self, metrics, step):
         import json
-        rec = {"step": int(step)} | {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))}
-        self._f.write(json.dumps(rec) + "\n"); self._f.flush()
+        rec = {"step": int(step)} | {
+            k: float(v) for k, v in metrics.items()
+            if isinstance(v, (int, float))
+        }
+        self._f.write(json.dumps(rec) + "\n")
+        self._f.flush()
 
-    def log_hyperparams(self, params): pass
-    def save(self): self._f.flush()
-    def finalize(self, status): self._f.close()
+    def log_hyperparams(self, params):
+        pass
+
+    def save(self):
+        self._f.flush()
+
+    @rank_zero_only
+    def finalize(self, status):
+        self._f.close()
 
 def build_loggers(log_cfg: Dict[str, Any], run_dir: Path):
     typ = (log_cfg.get("logger") or "tensorboard").lower()

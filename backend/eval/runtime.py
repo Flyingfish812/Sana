@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
+from pytorch_lightning.utilities import rank_zero_only
 
 from backend.common import ensure_5d, ensure_dir, extract_xy, move_batch_to_device
 from backend.viz.images import save_quadruple_grid
@@ -34,7 +35,6 @@ def _build_pyramid(x: torch.Tensor, levels: int) -> List[torch.Tensor]:
         out.append(cur)
     return out
 
-
 def _resolve_layout_tag(batch, layout_tag_key: str):
     tag = None
     if isinstance(batch, (list, tuple)) and len(batch) >= 3:
@@ -48,6 +48,7 @@ def _resolve_layout_tag(batch, layout_tag_key: str):
                 tag = ds.meta.get(layout_tag_key, None)
     return tag
 
+@rank_zero_only
 @torch.no_grad()
 def evaluate(model, test_dl, run_dir: Path, cfg_eval: Dict[str, Any]):
     """
@@ -795,6 +796,7 @@ def ensure_eval_multiscale_vis(
     except Exception as e:
         print(f"[multiscale-vis] skipped due to error: {e}")
 
+@rank_zero_only
 @torch.no_grad()
 def render_multiscale_panels(
     model,
@@ -981,6 +983,7 @@ def render_multiscale_panels(
 
     return out_dir
 
+@rank_zero_only
 @torch.no_grad()
 def render_eval_triplets(
     model,
