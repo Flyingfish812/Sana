@@ -205,3 +205,48 @@ class ProbeDebugVisualizer:
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
         fig.savefig(out_path, dpi=160)
         plt.close(fig)
+
+    @staticmethod
+    def save_quadruplet(
+        input_hw: np.ndarray,
+        pred_hw: np.ndarray,
+        target_hw: np.ndarray,
+        residual_hw: np.ndarray,
+        out_path: Path,
+        sample_points_xy: Optional[np.ndarray] = None,
+        cmap: str = "RdBu_r",
+        residual_cmap: str = "bwr",
+    ) -> None:
+        """将单样本输入、预测、真值、残差保存为 2x2 四联图。"""
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig, axes = plt.subplots(2, 2, figsize=(10, 8), constrained_layout=True)
+
+        residual_arr = np.asarray(residual_hw, dtype=np.float32)
+        finite = residual_arr[np.isfinite(residual_arr)]
+        if finite.size == 0:
+            residual_vmax = 1.0
+        else:
+            residual_vmax = float(np.max(np.abs(finite)))
+            residual_vmax = max(residual_vmax, 1e-8)
+
+        tiles = [
+            ("input", input_hw, cmap),
+            ("pred", pred_hw, cmap),
+            ("target", target_hw, cmap),
+            ("residual", residual_hw, residual_cmap),
+        ]
+
+        for ax, (title, arr, cm) in zip(axes.ravel(), tiles):
+            if title == "residual":
+                im = ax.imshow(arr, cmap=cm, vmin=-residual_vmax, vmax=residual_vmax)
+            else:
+                im = ax.imshow(arr, cmap=cm)
+            ax.set_title(title)
+            ax.set_axis_off()
+            if sample_points_xy is not None and len(sample_points_xy) > 0 and title == "input":
+                pts = np.asarray(sample_points_xy)
+                ax.scatter(pts[:, 0], pts[:, 1], facecolors="none", edgecolors="k", s=22, linewidths=0.8)
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+
+        fig.savefig(out_path, dpi=170)
+        plt.close(fig)

@@ -9,6 +9,7 @@ from torch.utils.data import Dataset
 from backend2.l1 import load_l1_array_and_splits
 
 from .artifact_io import ArtifactManager
+from .sparse_input import SparseInputConfig, apply_sparse_sampling_1nn, build_fixed_points_mask, sample_noise_seed
 
 
 FramePair = Tuple[int, int]
@@ -112,11 +113,41 @@ def load_split_pairs(
 
 class PairDataset(Dataset):
     """将 (n,t) 样本对包装为可喂给 PyTorch 的监督数据集。"""
-    def __init__(self, array5d: np.ndarray, pairs: Sequence[FramePair], target_offset: int = 1):
+    def __init__(
+        self,
+        array5d: np.ndarray,
+        pairs: Sequence[FramePair],
+        target_offset: int = 1,
+        sparse_input: Dict[str, object] | None = None,
+        dataset_id: str = "",
+    ):
         """保存数组、样本对和归一化配置。"""
         self.array5d = array5d
         self.pairs = list(pairs)
         self.target_offset = int(target_offset)
+        self.sparse_cfg = SparseInputConfig.from_dict(sparse_input)
+        self.sparse_cfg.validate()
+        self.dataset_id = str(dataset_id)
+
+        self.sample_points_mask_hw: np.ndarray | None = None
+        self.sample_points_xy = np.zeros((0, 2), dtype=np.int64)
+
+        if self.sparse_cfg.enabled:
+            h, w, _ = tuple(int(v) for v in self.array5d.shape[2:])
+            finite_ref = np.isfinite(self.array5d[0, 0])
+            valid_mask_hw = np.all(finite_ref, axis=-1)
+            if not np.any(valid_mask_hw):
+                valid_mask_hw = None
+            mask_hw, points_xy = build_fixed_points_mask(
+                h=h,
+                w=w,
+                sample_p=float(self.sparse_cfg.sample_p),
+                seed=int(self.sparse_cfg.sample_seed),
+                dataset_id=self.dataset_id,
+                valid_mask_hw=valid_mask_hw,
+            )
+            self.sample_points_mask_hw = mask_hw.astype(np.bool_, copy=False)
+            self.sample_points_xy = points_xy.astype(np.int64, copy=False)
 
     def __len__(self) -> int:
         """返回样本对数量。"""
@@ -128,8 +159,23 @@ class PairDataset(Dataset):
         x_hwc = self.array5d[n, t]
         y_hwc = self.array5d[n, t + self.target_offset]
 
-        mask_hwc = np.isfinite(x_hwc).astype(np.float32)
-        x_hwc = np.nan_to_num(x_hwc, nan=0.0, posinf=0.0, neginf=0.0)
+        if self.sparse_cfg.enabled and self.sample_points_mask_hw is not None:
+            x_hwc = apply_sparse_sampling_1nn(
+                x_hwc=x_hwc,
+                points_mask_hw=self.sample_points_mask_hw,
+                sample_sigma=float(self.sparse_cfg.sample_sigma),
+                noise_seed=sample_noise_seed(int(self.sparse_cfg.sample_seed), int(n), int(t)),
+            )
+            c = int(x_hwc.shape[-1])
+            mask_hwc = np.repeat(self.sample_points_mask_hw[:, :, None].astype(np.float32), c, axis=2)
+
+            if bool(self.sparse_cfg.append_mask_channel):
+                marker = self.sample_points_mask_hw[:, :, None].astype(np.float32)
+                x_hwc = np.concatenate([x_hwc, marker], axis=2)
+        else:
+            mask_hwc = np.isfinite(x_hwc).astype(np.float32)
+            x_hwc = np.nan_to_num(x_hwc, nan=0.0, posinf=0.0, neginf=0.0)
+
         y_hwc = np.nan_to_num(y_hwc, nan=0.0, posinf=0.0, neginf=0.0)
 
         x = torch.from_numpy(np.transpose(x_hwc, (2, 0, 1)).astype(np.float32))

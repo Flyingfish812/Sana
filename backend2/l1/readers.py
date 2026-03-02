@@ -16,6 +16,28 @@ import scipy.io as sio
 from .types import DataMeta, Shape5D
 
 
+def _fill_non_finite(arr: np.ndarray, fill_value: Optional[Union[float, str]]) -> np.ndarray:
+    """按配置替换 NaN/Inf；支持常数填充与全场均值填充。"""
+    if fill_value is None:
+        return np.asarray(arr)
+
+    out = np.asarray(arr)
+    if isinstance(fill_value, str):
+        mode = fill_value.strip().lower()
+        if mode != "global_mean":
+            raise ValueError(f"unsupported fill_value mode '{fill_value}', expected 'global_mean' or numeric")
+        finite = np.isfinite(out)
+        if np.any(finite):
+            mean_value = float(np.mean(out[finite]))
+        else:
+            mean_value = 0.0
+        out = np.where(finite, out, mean_value)
+        return out
+
+    scalar = float(fill_value)
+    return np.nan_to_num(out, nan=scalar, posinf=scalar, neginf=scalar)
+
+
 class BaseReader(ABC):
     """统一数据读取接口，负责输出标准 NTHWC 结构。"""
     @abstractmethod
@@ -44,7 +66,7 @@ class H5Reader(BaseReader):
         dataset: Optional[Union[str, List[str]]] = None,
         group: Optional[str] = None,
         times_key: Optional[str] = None,
-        fill_value: Optional[float] = None,
+        fill_value: Optional[Union[float, str]] = None,
         sample_ratio: Optional[float] = None,
         sample_mode: str = "interval",
         full_construction: bool = False,
@@ -96,8 +118,7 @@ class H5Reader(BaseReader):
     def _read_ds(self, ds: h5py.Dataset) -> np.ndarray:
         """读取单个数据集并按需替换 NaN/Inf。"""
         arr = ds[...]
-        if self.fill_value is not None:
-            arr = np.nan_to_num(arr, nan=self.fill_value, posinf=self.fill_value, neginf=self.fill_value)
+        arr = _fill_non_finite(arr, self.fill_value)
         return np.asarray(arr)
 
     def _to_thwc(self, a: np.ndarray) -> np.ndarray:
@@ -309,7 +330,7 @@ class NCReader(BaseReader):
         time_key: Optional[str] = None,
         y_key: Optional[str] = None,
         x_key: Optional[str] = None,
-        fill_value: Optional[float] = None,
+        fill_value: Optional[Union[float, str]] = None,
         path_compat_workaround: bool = True,
     ):
         """初始化 NCReader 并缓存探测结果。"""
@@ -456,8 +477,7 @@ class NCReader(BaseReader):
             for key in self.var_keys:
                 raw = np.asarray(ds.variables[key][:])
                 thw = self._reorder_to_thw(ds, key, raw, self.time_key, self.y_key, self.x_key)
-                if self.fill_value is not None:
-                    thw = np.nan_to_num(thw, nan=self.fill_value, posinf=self.fill_value, neginf=self.fill_value)
+                thw = _fill_non_finite(thw, self.fill_value)
                 thw_list.append(thw.astype(np.float32, copy=False))
 
             if self.want_omega:
@@ -489,7 +509,7 @@ class MatReader(BaseReader):
         lon_key: Optional[str] = None,
         lat_key: Optional[str] = None,
         time_key: Optional[str] = None,
-        fill_value: Optional[float] = None,
+        fill_value: Optional[Union[float, str]] = None,
     ):
         """初始化 MatReader 并缓存探测结果。"""
         self.path = path
@@ -559,8 +579,7 @@ class MatReader(BaseReader):
         """将 MAT 内容构建为标准 [N,T,H,W,C] 数组。"""
         var, lon, lat, times = self._read_core()
         thw = self._reshape_var(var, lon, lat)
-        if self.fill_value is not None:
-            thw = np.nan_to_num(thw, nan=self.fill_value, posinf=self.fill_value, neginf=self.fill_value)
+        thw = _fill_non_finite(thw, self.fill_value)
         out = thw[..., None][None, ...]
         self._times = times
         return out

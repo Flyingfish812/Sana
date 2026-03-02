@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from .artifact_io import ArtifactManager
 from .data import PairDataset, load_l1_array_mmap, load_split_pairs
-from .model_unet import BaselineUNet
+from .model_factory import build_l2_model
 from .probe import ProbeCallback, ProbeController
 from .utils import dump_json, iter_progress, log_progress, now_iso, read_json
 
@@ -212,14 +212,17 @@ def load_frozen_features(manager: ArtifactManager, split: str = "test") -> Dict[
     }
 
 
-def _build_model_for_online(array5d: np.ndarray, config: Dict[str, Any], manager: ArtifactManager) -> torch.nn.Module:
+def _build_model_for_online(
+    in_channels: int,
+    out_channels: int,
+    config: Dict[str, Any],
+    manager: ArtifactManager,
+) -> torch.nn.Module:
     device = _device_of(config)
-    model_cfg = dict(config.get("model") or {})
-    model = BaselineUNet(
-        in_channels=int(array5d.shape[-1]),
-        out_channels=int(array5d.shape[-1]),
-        base_channels=int(model_cfg.get("base_channels", 32)),
-        convs_per_stage=int(model_cfg.get("convs_per_stage", 2)),
+    model = build_l2_model(
+        config,
+        in_channels=int(in_channels),
+        out_channels=int(out_channels),
     ).to(device)
 
     ckpt_name = str(config.get("ckpt_name", "model_best.pt"))
@@ -256,7 +259,13 @@ def extract_features_online(
     if len(pairs) == 0:
         raise ValueError(f"empty {split} pairs from L1 split")
 
-    dataset = PairDataset(array5d=array5d, pairs=pairs, target_offset=target_offset)
+    dataset = PairDataset(
+        array5d=array5d,
+        pairs=pairs,
+        target_offset=target_offset,
+        sparse_input=dict(config.get("sparse_input") or {}),
+        dataset_id=str(config.get("dataset_id", manager.dataset_id)),
+    )
     loader = DataLoader(
         dataset,
         batch_size=int(config.get("batch_size", 8)),
@@ -273,7 +282,13 @@ def extract_features_online(
     collector = FeatureFreezeCollector(layer_patterns=freeze_layers)
     probe = ProbeController(probe_cfg, callbacks=[collector])
 
-    model = _build_model_for_online(array5d=array5d, config=config, manager=manager)
+    sample0 = dataset[0]
+    model = _build_model_for_online(
+        in_channels=int(sample0["x"].shape[0]),
+        out_channels=int(sample0["y"].shape[0]),
+        config=config,
+        manager=manager,
+    )
     device = _device_of(config)
     log_progress(log_enabled, "L2.5-ONLINE", f"model loaded on {device}")
 

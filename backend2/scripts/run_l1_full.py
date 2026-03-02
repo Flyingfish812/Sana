@@ -64,7 +64,7 @@ def full_l1_configs(artifacts_dir: str = "artifacts", h5_full_construction: bool
                 "lon_key": "lon",
                 "lat_key": "lat",
                 "time_key": "time",
-                "fill_value": 0.0,
+                "fill_value": "global_mean",
             },
             "split": {
                 "strategy": "temporal",

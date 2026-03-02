@@ -64,7 +64,7 @@ def _l1_configs() -> List[Dict[str, Any]]:
                 "lon_key": "lon",
                 "lat_key": "lat",
                 "time_key": "time",
-                "fill_value": 0.0,
+                "fill_value": "global_mean",
             },
             "split": {
                 "strategy": "temporal",

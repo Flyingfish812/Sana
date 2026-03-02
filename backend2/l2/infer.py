@@ -12,8 +12,8 @@ from .artifact_io import ArtifactManager
 from .data import PairDataset, load_l1_array_mmap, load_split_pairs
 from .freeze import FeatureFreezeCollector, build_probe_config_for_freeze, resolve_freeze_layers, save_frozen_features
 from .metrics import regression_metrics
-from .model_unet import BaselineUNet
-from .probe import ProbeController
+from .model_factory import build_l2_model
+from .probe import ProbeController, ProbeDebugVisualizer
 from .utils import dump_json, iter_progress, log_progress
 
 
@@ -53,7 +53,14 @@ def run_l2_infer(config: Dict[str, Any]) -> Dict[str, Any]:
     if len(test_pairs) == 0:
         raise ValueError("empty test pairs from L1 split")
 
-    test_ds = PairDataset(array5d=array5d, pairs=test_pairs, target_offset=target_offset)
+    sparse_input_cfg = dict(config.get("sparse_input") or {})
+    test_ds = PairDataset(
+        array5d=array5d,
+        pairs=test_pairs,
+        target_offset=target_offset,
+        sparse_input=sparse_input_cfg,
+        dataset_id=dataset_id,
+    )
     test_loader = DataLoader(
         test_ds,
         batch_size=int(config.get("batch_size", 8)),
@@ -73,15 +80,12 @@ def run_l2_infer(config: Dict[str, Any]) -> Dict[str, Any]:
     log_progress(log_enabled, "L2-INFER", f"checkpoint={ckpt_path}")
 
     device = _device_of(config)
-    in_channels = int(array5d.shape[-1])
-    model_cfg = dict(config.get("model", {}))
-    model = BaselineUNet(
-        in_channels=in_channels,
-        out_channels=in_channels,
-        base_channels=int(model_cfg.get("base_channels", 32)),
-        convs_per_stage=int(model_cfg.get("convs_per_stage", 2)),
-    ).to(device)
-    log_progress(log_enabled, "L2-INFER", f"model ready: in_channels={in_channels}, device={device}")
+    sample0 = test_ds[0]
+    in_channels = int(sample0["x"].shape[0])
+    out_channels = int(sample0["y"].shape[0])
+    model = build_l2_model(config, in_channels=in_channels, out_channels=out_channels).to(device)
+    model_type = str(config.get("model_type", dict(config.get("model", {})).get("type", "unet"))).lower()
+    log_progress(log_enabled, "L2-INFER", f"model ready: type={model_type}, in_channels={in_channels}, device={device}")
 
     try:
         state = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -138,15 +142,55 @@ def run_l2_infer(config: Dict[str, Any]) -> Dict[str, Any]:
     log_progress(log_enabled, "L2-INFER", f"metrics: mse={metrics.get('mse')}, mae={metrics.get('mae')}, rmse={metrics.get('rmse')}")
 
     preds_path = manager.infer_dir / "preds_test.npz"
+    if x_all.shape[1] < m_all.shape[1]:
+        raise ValueError(
+            f"input channels smaller than mask channels: input={x_all.shape[1]}, mask={m_all.shape[1]}"
+        )
+    obs_all = x_all.copy()
+    obs_all[:, : m_all.shape[1], :, :] = obs_all[:, : m_all.shape[1], :, :] * m_all
+
     np.savez_compressed(
         preds_path,
         input=x_all,
-        obs=x_all * m_all,
+        obs=obs_all,
         mask=m_all,
         gt=y_all,
         pred=p_all,
         pair_nt=nt_all,
+        sample_points_xy=np.asarray(getattr(test_ds, "sample_points_xy", np.zeros((0, 2), dtype=np.int64)), dtype=np.int64),
+        sample_points_mask=np.asarray(
+            getattr(test_ds, "sample_points_mask_hw", np.zeros((x_all.shape[-2], x_all.shape[-1]), dtype=np.uint8)),
+            dtype=np.uint8,
+        ),
+        sample_p=np.asarray([float(sparse_input_cfg.get("sample_p", 0.0))], dtype=np.float32),
+        sample_sigma=np.asarray([float(sparse_input_cfg.get("sample_sigma", 0.0))], dtype=np.float32),
+        sample_seed=np.asarray([int(sparse_input_cfg.get("sample_seed", 0))], dtype=np.int64),
     )
+
+    debug_plot = dict(config.get("debug_plot") or {})
+    debug_plot_out = ""
+    if bool(debug_plot.get("enabled", False)) and y_all.shape[0] > 0:
+        sample_index = int(debug_plot.get("sample_index", 0))
+        sample_index = max(0, min(sample_index, int(y_all.shape[0]) - 1))
+        channel = int(debug_plot.get("channel", 0))
+        channel = max(0, min(channel, int(y_all.shape[1]) - 1))
+        input_hw = x_all[sample_index, channel]
+        pred_hw = p_all[sample_index, channel]
+        target_hw = y_all[sample_index, channel]
+        residual_hw = pred_hw - target_hw
+        debug_plot_name = str(debug_plot.get("name", f"quad_sample{sample_index:04d}_ch{channel:02d}.png"))
+        debug_plot_path = manager.infer_dir / debug_plot_name
+        ProbeDebugVisualizer.save_quadruplet(
+            input_hw=input_hw,
+            pred_hw=pred_hw,
+            target_hw=target_hw,
+            residual_hw=residual_hw,
+            out_path=debug_plot_path,
+            sample_points_xy=np.asarray(getattr(test_ds, "sample_points_xy", np.zeros((0, 2), dtype=np.int64)), dtype=np.int64),
+        )
+        debug_plot_out = str(debug_plot_path)
+        log_progress(log_enabled, "L2-INFER", f"debug quadruplet saved: {debug_plot_path}")
+
     metrics_path = manager.infer_dir / "metrics_test.json"
     dump_json(metrics_path, metrics)
     log_progress(log_enabled, "L2-INFER", f"saved infer artifacts: preds={preds_path}, metrics={metrics_path}")
@@ -180,5 +224,6 @@ def run_l2_infer(config: Dict[str, Any]) -> Dict[str, Any]:
         "ckpt_used": str(ckpt_path),
         "probe_outputs": probe_outputs,
         "freeze_outputs": freeze_outputs,
+        "debug_plot": debug_plot_out,
         "metrics": metrics,
     }
