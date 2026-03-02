@@ -10,7 +10,7 @@ import numpy as np
 
 from .readers import build_reader
 from .splits import split_indices
-from .stats import compute_train_stats
+from .stats import compute_train_stats, write_normalized_array5d_memmap
 from .types import L1Summary
 
 
@@ -26,14 +26,6 @@ def _dump_json(path: Path, payload: Dict[str, Any]) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
-def _split_tag(split_cfg: Dict[str, Any]) -> str:
-    """根据切分配置生成稳定的 split 标识字符串。"""
-    strategy = split_cfg.get("strategy", "temporal")
-    unit = split_cfg.get("unit", "frame")
-    seed = int(split_cfg.get("seed", 123))
-    return f"{strategy}_{unit}_seed{seed}"
-
-
 def _log(enabled: bool, dataset_id: str, message: str) -> None:
     """按开关输出带数据集前缀的 L1 日志。"""
     if enabled:
@@ -41,7 +33,7 @@ def _log(enabled: bool, dataset_id: str, message: str) -> None:
 
 
 def run_l1_pipeline(config: Dict[str, Any]) -> L1Summary:
-    """执行 L1 全流程：读取数据、划分索引、统计训练归一化参数并落盘。"""
+    """执行 L1 全流程：读取数据、训练统计、全量归一化并冻结产物。"""
     t0 = time.perf_counter()
     dataset_id = str(config["dataset_id"])
     log_enabled = bool(config.get("log_progress", True))
@@ -88,24 +80,28 @@ def run_l1_pipeline(config: Dict[str, Any]) -> L1Summary:
     stats = compute_train_stats(array5d, splits["train"], unit=unit, method=method)
     _log(log_enabled, dataset_id, f"stats done: dt={time.perf_counter()-t_stats:.2f}s")
 
-    split_dir = l1_dir / "splits" / _split_tag(split_cfg)
+    split_dir = l1_dir / "splits"
     split_dir.mkdir(parents=True, exist_ok=True)
     _log(log_enabled, dataset_id, f"write split indices: {split_dir}")
     for name in ("train", "val", "test"):
         np.save(split_dir / f"{name}.npy", np.asarray(splits[name], dtype=np.int64))
 
-    if bool(config.get("save_array5d", False)):
-        base_dir = l1_dir / "base"
-        base_dir.mkdir(parents=True, exist_ok=True)
-        _log(log_enabled, dataset_id, f"write base array5d: {base_dir / 'array5d.npy'}")
-        np.save(base_dir / "array5d.npy", array5d)
+    _log(log_enabled, dataset_id, "normalize full array5d with train stats")
+    t_norm = time.perf_counter()
+    chunk_n = int(config.get("norm_chunk_n", 1))
+    out_path = l1_dir / "array5d_norm.npy"
+    write_normalized_array5d_memmap(array5d, stats, out_path, chunk_n=chunk_n)
+    del array5d
+    array5d_norm = np.load(out_path, mmap_mode="r")
+    _log(log_enabled, dataset_id, f"write normalized array done: dt={time.perf_counter()-t_norm:.2f}s")
 
     manifest = {
         "dataset_id": dataset_id,
         "created_at": _now_iso(),
         "layout": "NTHWC",
         "shape5d": list(shape5d),
-        "dtype": str(array5d.dtype),
+        "dtype": str(array5d_norm.dtype),
+        "array5d_norm": "array5d_norm.npy",
         "reader": {"kind": kind, **reader_cfg},
         "meta": meta.to_json(),
         "split": {
@@ -114,6 +110,11 @@ def run_l1_pipeline(config: Dict[str, Any]) -> L1Summary:
             "ratios": ratios,
             "seed": seed,
             "sizes": {k: len(v) for k, v in splits.items()},
+            "files": {
+                "train": "splits/train.npy",
+                "val": "splits/val.npy",
+                "test": "splits/test.npy",
+            },
         },
     }
     _dump_json(l1_dir / "manifest.json", manifest)

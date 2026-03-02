@@ -2,10 +2,16 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterable
 import hashlib
 import json
 import subprocess
+
+
+try:
+    from tqdm.auto import tqdm as _tqdm
+except Exception:
+    _tqdm = None
 
 
 def now_tag() -> str:
@@ -66,3 +72,24 @@ def build_code_version(cwd: Path) -> Dict[str, Any]:
         "git_commit": commit or None,
         "code_hash": _tree_fingerprint(cwd) if not commit else None,
     }
+
+
+def log_progress(enabled: bool, stage: str, message: str) -> None:
+    """按开关输出统一格式的 L2 进度日志。"""
+    if enabled:
+        print(f"[{stage}] {message}", flush=True)
+
+
+def iter_progress(
+    iterable: Iterable[Any],
+    *,
+    enabled: bool,
+    use_tqdm: bool,
+    desc: str,
+    total: int | None = None,
+    leave: bool = False,
+) -> Iterable[Any]:
+    """按配置返回普通迭代器或 tqdm 包裹迭代器。"""
+    if enabled and use_tqdm and _tqdm is not None:
+        return _tqdm(iterable, desc=desc, total=total, leave=leave, dynamic_ncols=True)
+    return iterable

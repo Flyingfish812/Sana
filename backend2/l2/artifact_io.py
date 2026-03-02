@@ -51,6 +51,21 @@ class ArtifactManager:
         return self.run_dir / "probe"
 
     @property
+    def freeze_dir(self) -> Path:
+        """返回 L2.5 冻结特征目录。"""
+        return self.run_dir / "freeze"
+
+    @property
+    def freeze_layers_dir(self) -> Path:
+        """返回 L2.5 分层特征目录。"""
+        return self.freeze_dir / "layers"
+
+    @property
+    def freeze_manifest_json(self) -> Path:
+        """返回 L2.5 冻结清单路径。"""
+        return self.freeze_dir / "manifest.json"
+
+    @property
     def train_config_json(self) -> Path:
         """返回训练配置文件路径。"""
         return self.run_dir / "train_config.json"
@@ -71,6 +86,7 @@ class ArtifactManager:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.infer_dir.mkdir(parents=True, exist_ok=True)
         self.probe_dir.mkdir(parents=True, exist_ok=True)
+        self.freeze_layers_dir.mkdir(parents=True, exist_ok=True)
 
     def l1_manifest_path(self) -> Path:
         """返回 L1 manifest 路径。"""
@@ -80,9 +96,13 @@ class ArtifactManager:
         """返回 L1 训练统计文件路径。"""
         return self.l1_dir / "stats_train.json"
 
-    def l1_split_path(self, split_tag: str, split_name: str) -> Path:
+    def l1_array_path(self) -> Path:
+        """返回 L1 归一化 5D 数组路径。"""
+        return self.l1_dir / "array5d_norm.npy"
+
+    def l1_split_path(self, split_name: str) -> Path:
         """返回 L1 指定切分索引文件路径。"""
-        return self.l1_dir / "splits" / split_tag / f"{split_name}.npy"
+        return self.l1_dir / "splits" / f"{split_name}.npy"
 
     def ckpt_path(self, name: str = "model_last.pt") -> Path:
         """返回指定名称检查点的完整路径。"""

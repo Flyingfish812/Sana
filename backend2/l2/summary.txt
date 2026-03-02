@@ -12,16 +12,15 @@ A) 训练入口: run_l2_train(config)
 - _device_of(config) 解析训练设备（auto/cuda/cpu）
 
 3) 读取 L1 产物并构造样本对
-- load_l1_array(manager):
-  - 读 L1 manifest.json -> 还原 reader 配置
-  - build_reader + read_array5d 读取原始 array5d
-  - 读 stats_train.json -> NormSpec.from_stats
-- load_split_pairs(manager, manifest, 'train'/'val', split_tag, target_offset)
+- load_l1_array_mmap(manager):
+  - 读 L1 manifest.json
+  - 以 mmap 方式加载 L1/array5d_norm.npy（不读入全量内存）
+- load_split_pairs(manager, array5d, manifest, 'train'/'val', target_offset)
   - frame/sequence 索引转换为 (n,t) 对
   - target 为 t + target_offset
 
 4) DataLoader 与模型
-- PairDataset(array5d, pairs, norm, target_offset)
+- PairDataset(array5d, pairs, target_offset)
 - DataLoader(train/val)
 - BaselineUNet(in_channels=C, out_channels=C, ...)
 - Optimizer: Adam
@@ -43,7 +42,7 @@ B) 推理入口: run_l2_infer(config)
 
 1) 运行上下文
 - ArtifactManager + ensure_run_dirs()
-- 读取 L1 array/manifest/norm
+- 读取 L1 array5d_norm mmap + manifest
 - 加载 test split -> 构建 test PairDataset + DataLoader
 
 2) 加载模型
@@ -68,3 +67,7 @@ B) 推理入口: run_l2_infer(config)
 L1(run_l1_pipeline) -> 生成 manifest/splits/stats
 L2 train(run_l2_train) -> 消费 L1 产物并训练
 L2 infer(run_l2_infer) -> 消费 L1 产物 + 训练ckpt 并产出预测与评估
+
+约束
+- L2/L3/L4 禁止调用 build_reader/read_array5d 读取原始数据
+- 下游统一通过 L1 冻结产物接口加载：load_l1_array_and_splits / build_dataloaders_from_l1

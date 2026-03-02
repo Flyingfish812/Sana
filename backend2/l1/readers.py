@@ -45,6 +45,9 @@ class H5Reader(BaseReader):
         group: Optional[str] = None,
         times_key: Optional[str] = None,
         fill_value: Optional[float] = None,
+        sample_ratio: Optional[float] = None,
+        sample_mode: str = "interval",
+        full_construction: bool = False,
     ):
         """初始化 H5Reader 并缓存探测结果。"""
         self.path = path
@@ -52,7 +55,38 @@ class H5Reader(BaseReader):
         self.group = group
         self.times_key = times_key
         self.fill_value = fill_value
+        self.sample_ratio = float(sample_ratio) if sample_ratio is not None else None
+        self.sample_mode = str(sample_mode)
+        self.full_construction = bool(full_construction)
         self._shape5d, self._meta = self._probe_file()
+
+    def _sample_n_indices(self, n_size: int) -> Optional[np.ndarray]:
+        """根据采样配置返回 N 轴抽样索引；返回 None 表示不采样。"""
+        if self.full_construction:
+            return None
+        if self.sample_ratio is None:
+            return None
+        ratio = float(self.sample_ratio)
+        if not (0.0 < ratio < 1.0):
+            return None
+        if n_size <= 1:
+            return np.arange(n_size, dtype=np.int64)
+        keep = max(1, int(round(n_size * ratio)))
+        if keep >= n_size:
+            return None
+        if self.sample_mode != "interval":
+            raise ValueError(f"unsupported sample_mode '{self.sample_mode}', expected 'interval'")
+        idx = np.linspace(0, n_size - 1, num=keep, dtype=np.int64)
+        return np.unique(idx)
+
+    def _apply_n_sampling(self, out: np.ndarray) -> np.ndarray:
+        """按 N 轴执行等间隔抽样。"""
+        if out.ndim != 5:
+            raise ValueError(f"expect 5D [N,T,H,W,C], got shape={out.shape}")
+        indices = self._sample_n_indices(int(out.shape[0]))
+        if indices is None:
+            return out
+        return out[indices]
 
     @staticmethod
     def _is_ds(x):
@@ -201,8 +235,18 @@ class H5Reader(BaseReader):
         """快速探测 H5 数据形状与元信息。"""
         with h5py.File(self.path, "r") as f:
             arr, times = self._collect(f)
+            arr = self._apply_n_sampling(arr)
         n, t, h, w, c = arr.shape
-        meta = DataMeta(times=times, attrs={"source": "h5", "path": self.path})
+        meta = DataMeta(
+            times=times,
+            attrs={
+                "source": "h5",
+                "path": self.path,
+                "sample_ratio": self.sample_ratio,
+                "sample_mode": self.sample_mode,
+                "full_construction": self.full_construction,
+            },
+        )
         return (n, t, h, w, c), meta
 
     def probe(self) -> Tuple[Shape5D, DataMeta]:
@@ -213,6 +257,7 @@ class H5Reader(BaseReader):
         """完整读取 H5 数据并返回标准 5D 数组。"""
         with h5py.File(self.path, "r") as f:
             arr, _ = self._collect(f)
+            arr = self._apply_n_sampling(arr)
         return self._ensure_5d(arr)
 
 

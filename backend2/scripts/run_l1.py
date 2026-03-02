@@ -53,7 +53,6 @@ def _inline_config(args: argparse.Namespace) -> Dict[str, Any]:
         },
         "normalization": {"method": args.norm},
         "artifacts_dir": args.artifacts_dir,
-        "save_array5d": args.save_array5d,
     }
 
 
@@ -80,7 +79,6 @@ def main() -> None:
     parser.add_argument("--test", type=float, default=0.1)
     parser.add_argument("--norm", type=str, choices=["zscore", "minmax"], default="zscore")
     parser.add_argument("--artifacts-dir", type=str, default="artifacts")
-    parser.add_argument("--save-array5d", action="store_true")
     args = parser.parse_args()
 
     if args.config:

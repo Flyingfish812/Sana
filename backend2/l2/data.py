@@ -1,74 +1,61 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from backend2.l1 import build_reader
+from backend2.l1 import load_l1_array_and_splits
 
 from .artifact_io import ArtifactManager
-from .utils import read_json
 
 
 FramePair = Tuple[int, int]
 
 
-@dataclass
-class NormSpec:
-    """归一化规格，封装 zscore/minmax 参数与应用逻辑。"""
-    method: str
-    mean: np.ndarray | None = None
-    std: np.ndarray | None = None
-    min_v: np.ndarray | None = None
-    scale: np.ndarray | None = None
+class IndexedDataset(Dataset):
+    """最小索引数据集：仅做索引映射，不复制底层数组。"""
 
-    @staticmethod
-    def from_stats(stats: Dict[str, object]) -> "NormSpec":
-        """从 L1 统计文件构建归一化规格对象。"""
-        method = str(stats.get("method", "zscore")).lower()
-        if method == "zscore":
-            return NormSpec(
-                method=method,
-                mean=np.asarray(stats["mean"], dtype=np.float32),
-                std=np.asarray(stats["std"], dtype=np.float32),
-            )
-        if method == "minmax":
-            return NormSpec(
-                method=method,
-                min_v=np.asarray(stats["min"], dtype=np.float32),
-                scale=np.asarray(stats["scale"], dtype=np.float32),
-            )
-        raise ValueError(f"unsupported norm method: {method}")
+    def __init__(self, array_mmap: np.ndarray, indices: Sequence[int], unit: str, shape5d: Sequence[int]):
+        """使用 mmap 数组与切分索引构造数据集。"""
+        self.array_mmap = array_mmap
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.unit = str(unit)
+        self.shape5d = tuple(int(x) for x in shape5d)
+        if len(self.shape5d) != 5:
+            raise ValueError(f"expected shape5d length=5, got {self.shape5d}")
+        if self.unit not in ("frame", "sequence"):
+            raise ValueError(f"unsupported unit '{self.unit}'")
 
-    def normalize(self, x_hwc: np.ndarray) -> np.ndarray:
-        """对单帧 HWC 数据做按通道归一化。"""
-        if self.method == "zscore":
-            return (x_hwc - self.mean.reshape(1, 1, -1)) / self.std.reshape(1, 1, -1)
-        return (x_hwc - self.min_v.reshape(1, 1, -1)) / self.scale.reshape(1, 1, -1)
+    def __len__(self) -> int:
+        """返回索引数量。"""
+        return int(self.indices.shape[0])
 
+    def __getitem__(self, idx: int):
+        """按 unit 将 split 索引映射到底层数组视图。"""
+        raw = int(self.indices[idx])
+        n_size, t_size, _, _, _ = self.shape5d
+        if self.unit == "frame":
+            if raw < 0 or raw >= n_size * t_size:
+                raise IndexError(f"frame index out of range: {raw}")
+            n = raw // t_size
+            t = raw % t_size
+            return {"n": n, "t": t, "frame": self.array_mmap[n, t]}
 
-def infer_split_tag(manifest: Dict[str, object]) -> str:
-    """从 manifest 推断默认 split_tag。"""
-    split = dict(manifest.get("split", {}))
-    strategy = str(split.get("strategy", "temporal"))
-    unit = str(split.get("unit", "frame"))
-    seed = int(split.get("seed", 123))
-    return f"{strategy}_{unit}_seed{seed}"
+        if raw < 0 or raw >= n_size:
+            raise IndexError(f"sequence index out of range: {raw}")
+        n = raw
+        return {"n": n, "sequence": self.array_mmap[n]}
 
 
-def load_l1_array(manager: ArtifactManager) -> tuple[np.ndarray, Dict[str, object], NormSpec]:
-    """加载 L1 原始数组、manifest 与归一化规格。"""
-    manifest = read_json(manager.l1_manifest_path())
-    reader_cfg = dict(manifest["reader"])
-    kind = str(reader_cfg.pop("kind"))
-    reader = build_reader(kind=kind, **reader_cfg)
-    array5d = reader.read_array5d()
-    stats = read_json(manager.l1_stats_path())
-    norm = NormSpec.from_stats(stats)
-    return array5d.astype(np.float32, copy=False), manifest, norm
+def load_l1_array_mmap(manager: ArtifactManager) -> tuple[np.ndarray, Dict[str, object]]:
+    """以 mmap 方式加载 L1 归一化数组与 manifest。"""
+    array5d, _, meta = load_l1_array_and_splits(manager.l1_dir)
+    manifest = dict(meta["manifest"])
+    if array5d.ndim != 5:
+        raise ValueError(f"expected 5D array from L1, got shape={array5d.shape}")
+    return array5d, manifest
 
 
 def frame_indices_to_pairs(shape5d: Sequence[int], split_indices: Sequence[int], target_offset: int) -> List[FramePair]:
@@ -98,32 +85,37 @@ def sequence_indices_to_pairs(shape5d: Sequence[int], split_indices: Sequence[in
 
 def load_split_pairs(
     manager: ArtifactManager,
+    array5d: np.ndarray,
     manifest: Dict[str, object],
     split_name: str,
-    split_tag: str | None,
     target_offset: int,
 ) -> List[FramePair]:
     """读取 L1 切分索引并映射为 L2 训练/验证/测试样本对。"""
-    tag = split_tag or infer_split_tag(manifest)
-    split_path = manager.l1_split_path(tag, split_name)
+    split_path = manager.l1_split_path(split_name)
     if not split_path.exists():
         raise FileNotFoundError(f"split file not found: {split_path}")
-    raw_idx = np.load(split_path).astype(np.int64).tolist()
+    raw_idx = np.load(split_path, mmap_mode="r")
 
     shape5d = manifest["shape5d"]
     unit = str(dict(manifest.get("split", {})).get("unit", "frame"))
     if unit == "sequence":
-        return sequence_indices_to_pairs(shape5d, raw_idx, target_offset)
-    return frame_indices_to_pairs(shape5d, raw_idx, target_offset)
+        seq_ds = IndexedDataset(array_mmap=array5d, indices=raw_idx, unit="sequence", shape5d=shape5d)
+        seq_indices = [int(seq_ds[i]["n"]) for i in range(len(seq_ds))]
+        return sequence_indices_to_pairs(shape5d, seq_indices, target_offset)
+    frame_ds = IndexedDataset(array_mmap=array5d, indices=raw_idx, unit="frame", shape5d=shape5d)
+    n_size, t_size = int(shape5d[0]), int(shape5d[1])
+    frame_indices = [int(frame_ds[i]["n"]) * t_size + int(frame_ds[i]["t"]) for i in range(len(frame_ds))]
+    if n_size <= 0:
+        return []
+    return frame_indices_to_pairs(shape5d, frame_indices, target_offset)
 
 
 class PairDataset(Dataset):
     """将 (n,t) 样本对包装为可喂给 PyTorch 的监督数据集。"""
-    def __init__(self, array5d: np.ndarray, pairs: Sequence[FramePair], norm: NormSpec, target_offset: int = 1):
+    def __init__(self, array5d: np.ndarray, pairs: Sequence[FramePair], target_offset: int = 1):
         """保存数组、样本对和归一化配置。"""
         self.array5d = array5d
         self.pairs = list(pairs)
-        self.norm = norm
         self.target_offset = int(target_offset)
 
     def __len__(self) -> int:
@@ -136,15 +128,12 @@ class PairDataset(Dataset):
         x_hwc = self.array5d[n, t]
         y_hwc = self.array5d[n, t + self.target_offset]
 
+        mask_hwc = np.isfinite(x_hwc).astype(np.float32)
         x_hwc = np.nan_to_num(x_hwc, nan=0.0, posinf=0.0, neginf=0.0)
         y_hwc = np.nan_to_num(y_hwc, nan=0.0, posinf=0.0, neginf=0.0)
-        mask_hwc = np.isfinite(self.array5d[n, t]).astype(np.float32)
 
-        x_norm = self.norm.normalize(x_hwc)
-        y_norm = self.norm.normalize(y_hwc)
-
-        x = torch.from_numpy(np.transpose(x_norm, (2, 0, 1)).astype(np.float32))
-        y = torch.from_numpy(np.transpose(y_norm, (2, 0, 1)).astype(np.float32))
+        x = torch.from_numpy(np.transpose(x_hwc, (2, 0, 1)).astype(np.float32))
+        y = torch.from_numpy(np.transpose(y_hwc, (2, 0, 1)).astype(np.float32))
         mask = torch.from_numpy(np.transpose(mask_hwc, (2, 0, 1)).astype(np.float32))
 
         return {

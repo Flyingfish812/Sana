@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict
 import random
+import time
 
 import numpy as np
 import torch
@@ -10,9 +11,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from .artifact_io import ArtifactManager
-from .data import PairDataset, load_l1_array, load_split_pairs
+from .data import PairDataset, load_l1_array_mmap, load_split_pairs
 from .model_unet import BaselineUNet
-from .utils import build_code_version, dump_json, dump_jsonl_line, now_iso
+from .utils import build_code_version, dump_json, dump_jsonl_line, iter_progress, log_progress, now_iso
 
 
 def _seed_all(seed: int) -> None:
@@ -33,13 +34,17 @@ def _device_of(cfg: Dict[str, Any]) -> torch.device:
 
 def run_l2_train(config: Dict[str, Any]) -> Dict[str, Any]:
     """执行 L2 训练：构建数据集、训练 UNet、保存日志与最佳模型。"""
+    t0_all = time.perf_counter()
     dataset_id = str(config["dataset_id"])
     artifacts_dir = str(config.get("artifacts_dir", "artifacts"))
     exp_name = str(config.get("exp_name", "baseline_unet"))
     run_name = config.get("run_name")
+    log_enabled = bool(config.get("log_progress", True))
+    use_tqdm = bool(config.get("tqdm", True))
 
     manager = ArtifactManager(artifacts_dir=artifacts_dir, dataset_id=dataset_id, exp_name=exp_name, run_name=run_name)
     manager.ensure_run_dirs()
+    log_progress(log_enabled, "L2-TRAIN", f"start dataset={dataset_id}, run={manager.run_name}")
 
     dump_json(manager.train_config_json, config)
     dump_json(manager.code_version_json, build_code_version(Path.cwd()))
@@ -47,23 +52,34 @@ def run_l2_train(config: Dict[str, Any]) -> Dict[str, Any]:
     seed = int(config.get("seed", 123))
     _seed_all(seed)
     device = _device_of(config)
+    log_progress(log_enabled, "L2-TRAIN", f"device={device}, seed={seed}")
 
+    t_data = time.perf_counter()
     target_offset = int(config.get("target_offset", 1))
-    split_tag = config.get("split_tag")
-    array5d, manifest, norm = load_l1_array(manager)
-    train_pairs = load_split_pairs(manager, manifest, "train", split_tag, target_offset)
-    val_pairs = load_split_pairs(manager, manifest, "val", split_tag, target_offset)
+    array5d, manifest = load_l1_array_mmap(manager)
+    train_pairs = load_split_pairs(manager, array5d, manifest, "train", target_offset)
+    val_pairs = load_split_pairs(manager, array5d, manifest, "val", target_offset)
+    log_progress(
+        log_enabled,
+        "L2-TRAIN",
+        f"data ready: shape={tuple(array5d.shape)}, train_pairs={len(train_pairs)}, val_pairs={len(val_pairs)}, dt={time.perf_counter()-t_data:.2f}s",
+    )
 
     if len(train_pairs) == 0:
         raise ValueError("empty train pairs from L1 split")
 
-    train_ds = PairDataset(array5d=array5d, pairs=train_pairs, norm=norm, target_offset=target_offset)
-    val_ds = PairDataset(array5d=array5d, pairs=val_pairs, norm=norm, target_offset=target_offset)
+    train_ds = PairDataset(array5d=array5d, pairs=train_pairs, target_offset=target_offset)
+    val_ds = PairDataset(array5d=array5d, pairs=val_pairs, target_offset=target_offset)
 
     batch_size = int(config.get("batch_size", 8))
     num_workers = int(config.get("num_workers", 0))
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    log_progress(
+        log_enabled,
+        "L2-TRAIN",
+        f"dataloader ready: batch_size={batch_size}, num_workers={num_workers}, train_steps={len(train_loader)}, val_steps={len(val_loader)}",
+    )
 
     in_channels = int(array5d.shape[-1])
     model_cfg = dict(config.get("model", {}))
@@ -76,16 +92,27 @@ def run_l2_train(config: Dict[str, Any]) -> Dict[str, Any]:
 
     optimizer = torch.optim.Adam(model.parameters(), lr=float(config.get("lr", 1e-3)))
     criterion = nn.MSELoss()
+    log_progress(log_enabled, "L2-TRAIN", f"model ready: in_channels={in_channels}, params={sum(p.numel() for p in model.parameters())}")
 
     best_val = float("inf")
     epochs = int(config.get("epochs", 20))
     log_path = manager.logs_dir / "train_log.jsonl"
+    log_progress(log_enabled, "L2-TRAIN", f"epochs={epochs}, train_log={log_path}")
 
     for epoch in range(1, epochs + 1):
+        t_epoch = time.perf_counter()
         model.train()
         train_loss_sum = 0.0
         train_steps = 0
-        for batch in train_loader:
+        train_iter = iter_progress(
+            train_loader,
+            enabled=log_enabled,
+            use_tqdm=use_tqdm,
+            desc=f"[L2-TRAIN][{dataset_id}] epoch {epoch}/{epochs} train",
+            total=len(train_loader),
+            leave=False,
+        )
+        for batch in train_iter:
             x = batch["x"].to(device)
             y = batch["y"].to(device)
             pred = model(x)
@@ -95,12 +122,22 @@ def run_l2_train(config: Dict[str, Any]) -> Dict[str, Any]:
             optimizer.step()
             train_loss_sum += float(loss.item())
             train_steps += 1
+            if hasattr(train_iter, "set_postfix") and train_steps % 10 == 0:
+                train_iter.set_postfix(loss=f"{loss.item():.4f}")
 
         model.eval()
         val_loss_sum = 0.0
         val_steps = 0
         with torch.no_grad():
-            for batch in val_loader:
+            val_iter = iter_progress(
+                val_loader,
+                enabled=log_enabled,
+                use_tqdm=use_tqdm,
+                desc=f"[L2-TRAIN][{dataset_id}] epoch {epoch}/{epochs} val",
+                total=len(val_loader),
+                leave=False,
+            )
+            for batch in val_iter:
                 x = batch["x"].to(device)
                 y = batch["y"].to(device)
                 pred = model(x)
@@ -132,6 +169,15 @@ def run_l2_train(config: Dict[str, Any]) -> Dict[str, Any]:
         if val_loss <= best_val:
             best_val = val_loss
             torch.save(state, manager.ckpt_path("model_best.pt"))
+            log_progress(log_enabled, "L2-TRAIN", f"epoch {epoch}/{epochs} new best val_loss={val_loss:.6f}")
+
+        log_progress(
+            log_enabled,
+            "L2-TRAIN",
+            f"epoch {epoch}/{epochs} done: train_loss={train_loss:.6f}, val_loss={val_loss:.6f}, dt={time.perf_counter()-t_epoch:.2f}s",
+        )
+
+    log_progress(log_enabled, "L2-TRAIN", f"finished dataset={dataset_id}, run={manager.run_name}, total_dt={time.perf_counter()-t0_all:.2f}s")
 
     return {
         **manager.summary(),

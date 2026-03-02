@@ -22,16 +22,21 @@ L1 Pipeline Summary (entry: run_l1_pipeline)
 
 5) 训练集统计量计算
 - 调用 compute_train_stats(array5d, splits['train'], unit, method)
+- frame/sequence 都使用流式聚合（不构造 [M,H,W,C] 大数组）
 - method 支持 zscore/minmax
 - 输出通道级 mean/std 或 min/max/scale
 
-6) L1 产物写入
-- split 索引: artifacts/<dataset_id>/L1/splits/<split_tag>/{train,val,test}.npy
-- （可选）基础数组: artifacts/<dataset_id>/L1/base/array5d.npy
+6) 全量归一化与产物冻结
+- 使用训练统计量按通道归一化（zscore/minmax）
+- 使用 open_memmap 分块写入 array5d_norm.npy，避免全量中间数组峰值
+
+7) L1 产物写入
+- 归一化数组: artifacts/<dataset_id>/L1/array5d_norm.npy
+- split 索引: artifacts/<dataset_id>/L1/splits/{train,val,test}.npy
 - 元数据: artifacts/<dataset_id>/L1/manifest.json
 - 统计量: artifacts/<dataset_id>/L1/stats_train.json
 
-7) 返回摘要
+8) 返回摘要
 - 返回 L1Summary:
   - dataset_id
   - shape5d
@@ -41,5 +46,6 @@ L1 Pipeline Summary (entry: run_l1_pipeline)
 
 关键约束
 - 统一数据布局为 NTHWC
-- split_tag 格式: <strategy>_<unit>_seed<seed>
-- L2 训练/推理依赖 L1 的 manifest/splits/stats
+- L1 只冻结一个标准化后的完整数组，不保存 train/val/test 子数组
+- 官方下游入口：load_l1_array_and_splits / build_dataloaders_from_l1
+- L2/L3/L4 禁止回退调用 build_reader/read_array5d

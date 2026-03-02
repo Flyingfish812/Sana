@@ -15,4 +15,5 @@ scipy
 torch
 torchinfo
 torchvision
+tqdm
 uvicorn
